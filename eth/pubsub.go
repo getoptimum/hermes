@@ -10,6 +10,7 @@ import (
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/encoder"
 	ethtypes "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
+	lru "github.com/hashicorp/golang-lru/v2"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	pubsubpb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -72,7 +73,10 @@ type PubSub struct {
 	gs   *pubsub.PubSub
 	dsr  host.DataStreamRenderer
 
-	meters *validationMeters
+	// seenBlocks remembers the first block root per (slot, proposer) so a second,
+	// different block for the same slot can be spotted without a beacon state.
+	seenBlocks *lru.Cache[string, [32]byte]
+	meters     *validationMeters
 
 	// withheldC carries trace events for messages the validator did not forward,
 	// so emitting them cannot block a validation worker.
@@ -94,11 +98,17 @@ func NewPubSub(h *host.Host, cfg *PubSubConfig) (*PubSub, error) {
 		dsr = NewKinesisOutput(cfg)
 	}
 
+	seenBlocks, err := newSeenBlockCache()
+	if err != nil {
+		return nil, fmt.Errorf("new seen block cache: %w", err)
+	}
+
 	ps := &PubSub{
-		host:      h,
-		cfg:       cfg,
-		dsr:       dsr,
-		withheldC: make(chan *host.TraceEvent, withheldQueueSize),
+		host:       h,
+		cfg:        cfg,
+		dsr:        dsr,
+		seenBlocks: seenBlocks,
+		withheldC:  make(chan *host.TraceEvent, withheldQueueSize),
 	}
 
 	if err := ps.initValidationMetrics(cfg.Meter); err != nil {

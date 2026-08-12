@@ -22,6 +22,7 @@ const eventTypeWithheldMessage = "WITHHELD_MESSAGE"
 // Nil until initValidationMetrics runs, so every record site is nil-checked.
 type validationMeters struct {
 	results         metric.Int64Counter
+	degraded        metric.Int64Counter
 	duration        metric.Float64Histogram
 	withheldDropped metric.Int64Counter
 }
@@ -34,6 +35,14 @@ func (p *PubSub) initValidationMetrics(meter metric.Meter) error {
 	results, err := meter.Int64Counter(
 		"validation_result_total",
 		metric.WithDescription("Gossip validation outcomes by topic, result and reason"),
+	)
+	if err != nil {
+		return err
+	}
+
+	degraded, err := meter.Int64Counter(
+		"validation_degraded_total",
+		metric.WithDescription("Messages that could not be fully validated, usually a cold proposer duty cache"),
 	)
 	if err != nil {
 		return err
@@ -58,6 +67,7 @@ func (p *PubSub) initValidationMetrics(meter metric.Meter) error {
 
 	p.meters = &validationMeters{
 		results:         results,
+		degraded:        degraded,
 		duration:        duration,
 		withheldDropped: withheldDropped,
 	}
@@ -116,6 +126,16 @@ func (p *PubSub) finishValidation(
 	}
 
 	return result
+}
+
+func (p *PubSub) recordDegraded(ctx context.Context, topic, reason string) {
+	if p.meters == nil {
+		return
+	}
+	p.meters.degraded.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("topic", topic),
+		attribute.String("reason", reason),
+	))
 }
 
 // withheldQueueSize bounds the backlog of withheld-message events. Small on
