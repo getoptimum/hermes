@@ -147,6 +147,7 @@ func NewNode(cfg *NodeConfig) (*Node, error) {
 		Tracer:                cfg.Tracer,
 		Meter:                 cfg.Meter,
 		PeerFilter:            cfg.PeerFilter,
+		DialBackoffMax:        cfg.DialBackoffMax,
 	}
 
 	// initialize libp2p host

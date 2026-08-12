@@ -423,6 +423,7 @@ func cmdEthAction(c *cli.Context) error {
 			Patterns: rootConfig.FilterPatterns,
 		},
 		DirectConnections: rootConfig.DirectConnections,
+		DialBackoffMax:    rootConfig.DialBackoffMax,
 		Validation: eth.ValidationConfig{
 			Mode:       eth.ValidationMode(rootConfig.ValidationMode),
 			FailOpen:   rootConfig.ValidationFailOpen,

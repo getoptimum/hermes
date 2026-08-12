@@ -71,6 +71,7 @@ var rootConfig = struct {
 	ValidationMode              string
 	ValidationFailOpen          bool
 	ValidationSlotWindow        uint64
+	DialBackoffMax              time.Duration
 
 	// unexported fields are derived from the configuration
 	awsConfig *aws.Config
@@ -120,6 +121,7 @@ var rootConfig = struct {
 	ValidationMode:              string(eth.ValidationModeOff), // upstream behaviour: observe, never withhold
 	ValidationFailOpen:          true,
 	ValidationSlotWindow:        4,
+	DialBackoffMax:              0, // 0 disables the backoff gater
 
 	// unexported fields are derived or initialized during startup
 	awsConfig:           nil,
@@ -380,6 +382,13 @@ var rootFlags = []cli.Flag{
 		Usage:       "Peer filter mode: disabled, denylist, or allowlist",
 		Value:       rootConfig.FilterMode,
 		Destination: &rootConfig.FilterMode,
+	},
+	&cli.DurationFlag{
+		Name:        "libp2p.dial-backoff.max",
+		EnvVars:     []string{"HERMES_LIBP2P_DIAL_BACKOFF_MAX"},
+		Usage:       "Cap on the per-peer dial backoff after refused connections. 0 disables the backoff",
+		Value:       rootConfig.DialBackoffMax,
+		Destination: &rootConfig.DialBackoffMax,
 	},
 	&cli.StringFlag{
 		Name:        "validation.mode",

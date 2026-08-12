@@ -123,6 +123,9 @@ type NodeConfig struct {
 	// Validation controls how much of a gossip message is checked before hermes
 	// forwards it. Off by default, which is upstream behaviour.
 	Validation ValidationConfig
+
+	// DialBackoffMax caps the per-peer backoff after refused dials. Zero disables it.
+	DialBackoffMax time.Duration
 }
 
 // Validate validates the [NodeConfig] [Node] configuration.
@@ -133,6 +136,11 @@ func (n *NodeConfig) Validate() error {
 
 	if err := n.Validation.Validate(); err != nil {
 		return err
+	}
+
+	// Only zero disables the backoff; a negative value would disable it silently.
+	if n.DialBackoffMax < 0 {
+		return fmt.Errorf("dial backoff max must not be negative, use 0 to disable")
 	}
 
 	if n.NetworkConfig == nil {
