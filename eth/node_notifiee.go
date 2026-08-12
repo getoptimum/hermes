@@ -148,9 +148,8 @@ func (n *Node) handleNewConnection(pid peer.ID) {
 					slog.Warn("Failed to store handshaked marker in peerstore", tele.LogAttrError(err))
 				}
 
-				// Cleared here, not on Connected: a connection that fails the
-				// handshake is not a success, and clearing it there would reset the
-				// count so repeated failures never escalated.
+				// Cleared here, not on Connected: clearing before the handshake
+				// succeeds would reset the count so failures never escalated.
 				if backoff := n.host.DialBackoff(); backoff != nil {
 					backoff.RecordSuccess(pid)
 				}

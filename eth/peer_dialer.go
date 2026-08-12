@@ -74,10 +74,8 @@ func (p *PeerDialer) Serve(ctx context.Context) error {
 			err := p.host.Connect(timeoutCtx, newPeer.AddrInfo) // failures happen all the time
 			cancel()
 
-			// A failed dial is the only signal that a peer does not want us, so it
-			// is what the backoff keys on. Our own gater vetoing the dial is not
-			// such a signal: the peer was never contacted, and counting it would
-			// let the backoff escalate from our retries alone.
+			// Our own gater vetoing means the peer was never contacted, so counting
+			// it would let the backoff escalate from our retries alone.
 			if err != nil && !errors.Is(err, swarm.ErrGaterDisallowedConnection) {
 				if backoff := p.host.DialBackoff(); backoff != nil {
 					backoff.RecordRefusal(newPeer.AddrInfo.ID)

@@ -28,15 +28,12 @@ type dialBackoffEntry struct {
 	until    time.Time
 }
 
-// dialBackoffForget is how long after a backoff expires a peer keeps its failure
-// count. Without it `failures` is a lifetime counter rather than the consecutive
-// count the escalation assumes, and a peer that refuses us once every few hours
-// would eventually be treated as permanently hostile.
+// How long an expired backoff keeps its failure count, so escalation reflects
+// consecutive refusals rather than a peer's whole history.
 const dialBackoffForget = 2 * time.Hour
 
-// DialBackoff suppresses redials to peers that recently refused us, keyed on
-// connection-level failures. It cannot infer gossip rejection, which is not
-// observable on the wire, so it reduces wasted dials but prevents no scoring.
+// DialBackoff suppresses redials to peers that recently refused us. It keys on
+// connection failures; gossip rejection is not observable, so it prevents no scoring.
 type DialBackoff struct {
 	mu      sync.Mutex
 	entries *lru.Cache[peer.ID, *dialBackoffEntry]
@@ -72,8 +69,6 @@ func NewDialBackoff(max time.Duration, exempt func(peer.ID) bool, meter metric.M
 }
 
 // RecordRefusal notes that a peer refused or dropped us, extending its backoff.
-// The growth is exponential so a persistently hostile peer is dropped for long
-// enough to matter, while a one-off refusal costs a minute.
 func (d *DialBackoff) RecordRefusal(p peer.ID) {
 	if d.isExempt(p) {
 		return
@@ -102,13 +97,26 @@ func (d *DialBackoff) RecordRefusal(p peer.ID) {
 	}
 
 	entry.failures++
-	penalty := dialBackoffBase << min(entry.failures-1, 16)
-	if penalty > d.max {
-		penalty = d.max
-	}
-	entry.until = time.Now().Add(penalty)
+	penalty := d.penaltyFor(entry.failures)
+	entry.until = now.Add(penalty)
 
 	slog.Debug("backing off peer after refusal", "peer", p.String(), "failures", entry.failures, "for", penalty)
+}
+
+// penaltyFor doubles the base once per consecutive refusal, up to max. A loop
+// rather than a shift so any max is reachable and the doubling cannot overflow.
+func (d *DialBackoff) penaltyFor(failures int) time.Duration {
+	penalty := dialBackoffBase
+	for i := 1; i < failures; i++ {
+		if penalty > d.max/2 {
+			return d.max
+		}
+		penalty *= 2
+	}
+	if penalty > d.max {
+		return d.max
+	}
+	return penalty
 }
 
 // RecordSuccess clears a peer's history once we hold a usable connection.
