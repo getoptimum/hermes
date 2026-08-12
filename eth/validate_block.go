@@ -147,18 +147,21 @@ func (p *PubSub) validateBeaconBlock(ctx context.Context, _ peer.ID, msg *pubsub
 		return p.finishValidation(ctx, msg, pubsub.ValidationIgnore, reasonSlotWindow, nil, start)
 	}
 
-	blockRoot, err := wrapped.Block().HashTreeRoot()
-	if err != nil {
-		return p.finishValidation(ctx, msg, pubsub.ValidationReject, reasonDecode, err, start)
-	}
-
 	proposerIndex := wrapped.Block().ProposerIndex()
 
 	// Gates the equivocation check: without a verified signature a forged block
 	// could claim the slot and get the real one ignored as a duplicate.
 	signatureVerified := false
+	var blockRoot [32]byte
 
 	if p.cfg.Validation.Mode == ValidationModeFull {
+		// Merkleizing a full block is the most expensive step here, so it waits
+		// until something actually needs the root.
+		blockRoot, err = wrapped.Block().HashTreeRoot()
+		if err != nil {
+			return p.finishValidation(ctx, msg, pubsub.ValidationReject, reasonDecode, err, start)
+		}
+
 		duty, domain, ok, authoritative := p.cfg.Chain.ProposerDutyForSlot(slot)
 		sigErr := error(nil)
 		if ok {
