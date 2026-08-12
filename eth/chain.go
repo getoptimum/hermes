@@ -71,6 +71,10 @@ type Chain struct {
 	Fork             chainFork
 	chainUpgradeSubs []chainUpgradeSubFn
 
+	// Proposer schedule for the current and next epoch, read by the pubsub
+	// validator so it never has to reach Prysm on the message path.
+	duties *proposerDutyCache
+
 	// TODO:
 	// - DataColumn Cache
 	// - Block Cache
@@ -89,6 +93,7 @@ func NewChain(ctx context.Context, cfg *ChainConfig) (*Chain, error) {
 		closeC:           make(chan struct{}),
 		statusHolder:     &StatusHolder{},
 		metadataHolder:   &MetadataHolder{},
+		duties:           newProposerDutyCache(),
 	}
 
 	err := chain.init(ctx)
@@ -144,6 +149,10 @@ func (c *Chain) epochUpdate(ctx context.Context) error {
 			"duration", time.Since(t),
 		)
 	}()
+	// Refresh before the chain head call so a ChainHead failure cannot starve
+	// the duty cache and silently degrade validation.
+	c.logProposerDutyRefresh(ctx)
+
 	// check if new hardfork
 	slog.Info("Getting Prysm's chain head...")
 	chainHead, err := c.cfg.clClient.ChainHead(ctx)

@@ -20,6 +20,13 @@ type DataStreamRenderer interface {
 	RenderPayload(evt *TraceEvent, msg *pubsub.Message, dst ssz.Unmarshaler) (*TraceEvent, error)
 }
 
+// DecodedDataStreamRenderer is implemented by renderers that can render an
+// already-decoded payload, letting a caller that had to decode for other reasons
+// avoid paying for a second decode.
+type DecodedDataStreamRenderer interface {
+	RenderDecodedPayload(evt *TraceEvent, msg *pubsub.Message, dst ssz.Unmarshaler) (*TraceEvent, error)
+}
+
 type DataStreamType int
 
 func (ds DataStreamType) String() string {

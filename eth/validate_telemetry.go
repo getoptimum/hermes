@@ -1,0 +1,164 @@
+package eth
+
+import (
+	"context"
+	"encoding/hex"
+	"log/slog"
+	"time"
+
+	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+
+	"github.com/probe-lab/hermes/host"
+	"github.com/probe-lab/hermes/tele"
+)
+
+// eventTypeWithheldMessage marks a message hermes declined to forward. It is
+// deliberately distinct from HANDLE_MESSAGE so consumers can tell an observed
+// message from a suppressed one.
+const eventTypeWithheldMessage = "WITHHELD_MESSAGE"
+
+// validationMeters holds the gossip validation instruments. Nil-safe: every
+// record is a no-op until initValidationMetrics runs, which keeps the validator
+// usable in tests that construct a PubSub directly.
+type validationMeters struct {
+	results  metric.Int64Counter
+	degraded metric.Int64Counter
+	duration metric.Float64Histogram
+}
+
+func (p *PubSub) initValidationMetrics(meter metric.Meter) error {
+	if meter == nil {
+		return nil
+	}
+
+	results, err := meter.Int64Counter(
+		"validation_result_total",
+		metric.WithDescription("Gossip validation outcomes by topic, result and reason"),
+	)
+	if err != nil {
+		return err
+	}
+
+	degraded, err := meter.Int64Counter(
+		"validation_degraded_total",
+		metric.WithDescription("Messages that could not be fully validated, usually a cold proposer duty cache"),
+	)
+	if err != nil {
+		return err
+	}
+
+	duration, err := meter.Float64Histogram(
+		"validation_duration_seconds",
+		metric.WithDescription("Time spent in the gossip validator, which is time added to propagation"),
+		metric.WithUnit("s"),
+	)
+	if err != nil {
+		return err
+	}
+
+	p.meters = &validationMeters{results: results, degraded: degraded, duration: duration}
+	return nil
+}
+
+// localID is nil-safe so the validator can be exercised without a libp2p host.
+func (p *PubSub) localID() peer.ID {
+	if p.host == nil {
+		return ""
+	}
+	return p.host.ID()
+}
+
+func validationResultLabel(result pubsub.ValidationResult) string {
+	switch result {
+	case pubsub.ValidationAccept:
+		return "accept"
+	case pubsub.ValidationReject:
+		return "reject"
+	case pubsub.ValidationIgnore:
+		return "ignore"
+	default:
+		return "unknown"
+	}
+}
+
+// finishValidation records the outcome and, for anything not forwarded, still
+// emits a trace event. hermes exists to observe, so suppressing a message must
+// not also erase the record of it.
+func (p *PubSub) finishValidation(
+	ctx context.Context,
+	msg *pubsub.Message,
+	result pubsub.ValidationResult,
+	reason string,
+	cause error,
+	start time.Time,
+) pubsub.ValidationResult {
+	label := validationResultLabel(result)
+	topic := msg.GetTopic()
+
+	if p.meters != nil {
+		attrs := metric.WithAttributes(
+			attribute.String("topic", topic),
+			attribute.String("result", label),
+			attribute.String("reason", reason),
+		)
+		p.meters.results.Add(ctx, 1, attrs)
+		p.meters.duration.Record(ctx, time.Since(start).Seconds(), metric.WithAttributes(
+			attribute.String("topic", topic),
+			attribute.String("result", label),
+		))
+	}
+
+	if result != pubsub.ValidationAccept {
+		p.emitWithheldMessage(ctx, msg, label, reason, cause)
+	}
+
+	return result
+}
+
+func (p *PubSub) recordDegraded(ctx context.Context, topic, reason string) {
+	if p.meters == nil {
+		return
+	}
+	p.meters.degraded.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("topic", topic),
+		attribute.String("reason", reason),
+	))
+}
+
+// emitWithheldMessage records a message that was not forwarded. It builds the
+// event from raw gossip metadata rather than the decoded object, because the
+// most interesting case is precisely the one that failed to decode.
+func (p *PubSub) emitWithheldMessage(ctx context.Context, msg *pubsub.Message, result, reason string, cause error) {
+	payload := map[string]any{
+		"PeerID":  p.localID().String(),
+		"Topic":   msg.GetTopic(),
+		"MsgID":   hex.EncodeToString([]byte(msg.ID)),
+		"MsgSize": len(msg.Data),
+		"From":    msg.ReceivedFrom.String(),
+		"Result":  result,
+		"Reason":  reason,
+	}
+	if cause != nil {
+		payload["Error"] = cause.Error()
+	}
+
+	evt := &host.TraceEvent{
+		Type:      eventTypeWithheldMessage,
+		Topic:     msg.GetTopic(),
+		PeerID:    p.localID(),
+		Timestamp: time.Now(),
+		Payload:   payload,
+	}
+
+	if err := p.cfg.DataStream.PutRecord(ctx, evt); err != nil {
+		slog.Warn(
+			"failed putting withheld message event",
+			"topic", msg.GetTopic(),
+			"reason", reason,
+			"err", tele.LogAttrError(err),
+		)
+	}
+}

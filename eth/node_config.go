@@ -119,6 +119,13 @@ type NodeConfig struct {
 
 	// DirectConnections ensurest that our host doesn't prune the connection from these nodes
 	DirectConnections []string
+
+	// Validation controls how much of a gossip message is checked before hermes
+	// forwards it. Off by default, which is upstream behaviour.
+	Validation ValidationConfig
+
+	// DialBackoffMax caps the per-peer backoff after refused dials. Zero disables it.
+	DialBackoffMax time.Duration
 }
 
 // Validate validates the [NodeConfig] [Node] configuration.

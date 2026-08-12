@@ -17,9 +17,11 @@ import (
 	"github.com/OffchainLabs/prysm/v7/api/server/structs"
 	"github.com/OffchainLabs/prysm/v7/config/params"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/primitives"
+	"github.com/OffchainLabs/prysm/v7/crypto/bls"
 	"github.com/OffchainLabs/prysm/v7/network/httputil"
 	eth "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
 	"github.com/OffchainLabs/prysm/v7/time/slots"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/libp2p/go-libp2p/core/peer"
 	ma "github.com/multiformats/go-multiaddr"
 	"go.opentelemetry.io/otel"
@@ -279,6 +281,93 @@ func (p *PrysmClient) RemoveTrustedPeer(ctx context.Context, pid peer.ID) (err e
 	}
 
 	return nil
+}
+
+// ProposerDuty is one slot's entry in the proposer schedule. The public key is
+// deserialized here, at fetch time, so signature verification on the gossip
+// path never pays the subgroup check.
+type ProposerDuty struct {
+	Index     primitives.ValidatorIndex
+	PublicKey bls.PublicKey
+}
+
+// ProposerDuties returns the proposer schedule for epoch, keyed by slot.
+//
+// Deliberately the v2 route: Prysm v7 serves both, but marks v1 deprecated, so
+// v1 is the one that will eventually be removed.
+func (p *PrysmClient) ProposerDuties(ctx context.Context, epoch primitives.Epoch) (duties map[primitives.Slot]ProposerDuty, err error) {
+	ctx, span := p.tracer.Start(ctx, "prysm_client.proposer_duties", trace.WithAttributes(attribute.Int64("epoch", int64(epoch))))
+	defer func() {
+		if err != nil {
+			span.SetStatus(codes.Error, err.Error())
+			span.RecordError(err)
+		}
+		span.End()
+	}()
+
+	u := url.URL{
+		Scheme: p.scheme,
+		Host:   fmt.Sprintf("%s:%d", p.host, p.port),
+		Path:   fmt.Sprintf("/eth/v2/validator/duties/proposer/%d", epoch),
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, p.timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("new proposer duties request: %w", err)
+	}
+
+	resp, err := p.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("proposer duties http get failed: %w", err)
+	}
+	defer logDeferErr(resp.Body.Close, "Failed closing body")
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, parseErrorResponse(resp)
+	}
+
+	respData, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed reading response body: %w", err)
+	}
+
+	dutiesResp := &structs.GetProposerDutiesResponse{}
+	if err := json.Unmarshal(respData, dutiesResp); err != nil {
+		return nil, fmt.Errorf("failed unmarshalling response data: %w", err)
+	}
+
+	duties = make(map[primitives.Slot]ProposerDuty, len(dutiesResp.Data))
+	for _, d := range dutiesResp.Data {
+		slot, err := strconv.ParseUint(d.Slot, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("parse duty slot %q: %w", d.Slot, err)
+		}
+
+		index, err := strconv.ParseUint(d.ValidatorIndex, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("parse duty validator index %q: %w", d.ValidatorIndex, err)
+		}
+
+		rawKey, err := hexutil.Decode(d.Pubkey)
+		if err != nil {
+			return nil, fmt.Errorf("decode duty pubkey %q: %w", d.Pubkey, err)
+		}
+
+		pubKey, err := bls.PublicKeyFromBytes(rawKey)
+		if err != nil {
+			return nil, fmt.Errorf("deserialize duty pubkey for slot %d: %w", slot, err)
+		}
+
+		duties[primitives.Slot(slot)] = ProposerDuty{
+			Index:     primitives.ValidatorIndex(index),
+			PublicKey: pubKey,
+		}
+	}
+
+	return duties, nil
 }
 
 //lint:ignore SA1019 gRPC API deprecated but still supported until v8 (2026)

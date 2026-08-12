@@ -10,11 +10,13 @@ import (
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/encoder"
 	ethtypes "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
+	lru "github.com/hashicorp/golang-lru/v2"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	pubsubpb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p/core/peer"
 	ssz "github.com/prysmaticlabs/fastssz"
 	"github.com/thejerf/suture/v4"
+	"go.opentelemetry.io/otel/metric"
 
 	"github.com/probe-lab/hermes/host"
 	"github.com/probe-lab/hermes/tele"
@@ -28,11 +30,17 @@ type PubSubConfig struct {
 	Encoder        encoder.NetworkEncoding
 	SecondsPerSlot time.Duration
 	DataStream     host.DataStream
+	Validation     ValidationConfig
+	Meter          metric.Meter
 }
 
 func (p PubSubConfig) Validate() error {
 	if p.Encoder == nil {
 		return fmt.Errorf("nil encoder")
+	}
+
+	if err := p.Validation.Validate(); err != nil {
+		return err
 	}
 
 	if p.SecondsPerSlot == 0 {
@@ -55,6 +63,11 @@ type PubSub struct {
 	cfg  *PubSubConfig
 	gs   *pubsub.PubSub
 	dsr  host.DataStreamRenderer
+
+	// seenBlocks remembers the first block root per (slot, proposer) so a second,
+	// different block for the same slot can be spotted without a beacon state.
+	seenBlocks *lru.Cache[string, [32]byte]
+	meters     *validationMeters
 }
 
 func NewPubSub(h *host.Host, cfg *PubSubConfig) (*PubSub, error) {
@@ -72,11 +85,23 @@ func NewPubSub(h *host.Host, cfg *PubSubConfig) (*PubSub, error) {
 		dsr = NewKinesisOutput(cfg)
 	}
 
-	return &PubSub{
-		host: h,
-		cfg:  cfg,
-		dsr:  dsr,
-	}, nil
+	seenBlocks, err := newSeenBlockCache()
+	if err != nil {
+		return nil, fmt.Errorf("new seen block cache: %w", err)
+	}
+
+	ps := &PubSub{
+		host:       h,
+		cfg:        cfg,
+		dsr:        dsr,
+		seenBlocks: seenBlocks,
+	}
+
+	if err := ps.initValidationMetrics(cfg.Meter); err != nil {
+		return nil, fmt.Errorf("init validation metrics: %w", err)
+	}
+
+	return ps, nil
 }
 
 func (p *PubSub) Serve(ctx context.Context) error {
@@ -87,6 +112,15 @@ func (p *PubSub) Serve(ctx context.Context) error {
 	supervisor := suture.NewSimple("pubsub")
 
 	for _, topicName := range p.cfg.Topics {
+		// Register before joining: a validator attached after the first message
+		// arrives would let that message through unchecked.
+		if validator := p.mapPubSubTopicWithValidators(topicName); validator != nil {
+			if err := p.gs.RegisterTopicValidator(topicName, validator); err != nil {
+				return fmt.Errorf("register topic validator %s: %w", topicName, err)
+			}
+			slog.Info("Registered gossip validator", "topic", topicName, "mode", p.cfg.Validation.Mode)
+		}
+
 		topic, err := p.gs.Join(topicName)
 		if err != nil {
 			return fmt.Errorf("join pubsub topic %s: %w", topicName, err)
@@ -112,6 +146,17 @@ func (p *PubSub) Serve(ctx context.Context) error {
 	}
 
 	return supervisor.Serve(ctx)
+}
+
+// renderPayload renders msg, reusing the decode the validator already performed
+// when there is one. fresh is the empty destination for the unvalidated path.
+func (p *PubSub) renderPayload(evt *host.TraceEvent, msg *pubsub.Message, fresh ssz.Unmarshaler) (*host.TraceEvent, error) {
+	if decoded, ok := msg.ValidatorData.(ssz.Unmarshaler); ok {
+		if r, ok := p.dsr.(host.DecodedDataStreamRenderer); ok {
+			return r.RenderDecodedPayload(evt, msg, decoded)
+		}
+	}
+	return p.dsr.RenderPayload(evt, msg, fresh)
 }
 
 func (p *PubSub) mapPubSubTopicWithHandlers(topic string) host.TopicHandler {
@@ -172,26 +217,12 @@ func (p *PubSub) handleBeaconBlock(ctx context.Context, msg *pubsub.Message) err
 		block ssz.Unmarshaler
 	)
 
-	switch p.cfg.Chain.CurrentFork() {
-	case phase0:
-		block = &ethtypes.SignedBeaconBlock{}
-	case altair:
-		block = &ethtypes.SignedBeaconBlockAltair{}
-	case bellatrix:
-		block = &ethtypes.SignedBeaconBlockBellatrix{}
-	case capella:
-		block = &ethtypes.SignedBeaconBlockCapella{}
-	case deneb:
-		block = &ethtypes.SignedBeaconBlockDeneb{}
-	case electra:
-		block = &ethtypes.SignedBeaconBlockElectra{}
-	case fulu:
-		block = &ethtypes.SignedBeaconBlockFulu{}
-	default:
-		return fmt.Errorf("handleBeaconBlock(): unrecognized fork-version: %d", p.cfg.Chain.CurrentFork())
+	block, err = blockForFork(p.cfg.Chain.CurrentFork())
+	if err != nil {
+		return fmt.Errorf("handleBeaconBlock(): %w", err)
 	}
 
-	evt, err = p.dsr.RenderPayload(evt, msg, block)
+	evt, err = p.renderPayload(evt, msg, block)
 	if err != nil {
 		slog.Warn(
 			"failed rendering topic handler event", "topic", msg.GetTopic(), "err", tele.LogAttrError(err),

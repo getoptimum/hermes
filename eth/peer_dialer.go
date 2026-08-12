@@ -69,8 +69,16 @@ func (p *PeerDialer) Serve(ctx context.Context) error {
 			// finally, start the connection establishment.
 			// The success case is handled in net_notifiee.go.
 			timeoutCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-			_ = p.host.Connect(timeoutCtx, newPeer.AddrInfo) // ignore error, this happens all the time
+			err := p.host.Connect(timeoutCtx, newPeer.AddrInfo) // failures happen all the time
 			cancel()
+
+			// A failed dial is the only signal we get that a peer does not want
+			// us, so it is what the backoff is keyed on.
+			if err != nil {
+				if backoff := p.host.DialBackoff(); backoff != nil {
+					backoff.RecordRefusal(newPeer.AddrInfo.ID)
+				}
+			}
 
 		case network.Connected:
 			continue // the peer is already connected

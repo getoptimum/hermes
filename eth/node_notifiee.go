@@ -31,6 +31,10 @@ var _ network.Notifiee = (*Node)(nil)
 func (n *Node) Connected(net network.Network, c network.Conn) {
 	slog.Debug("Connected with peer", tele.LogAttrPeerID(c.RemotePeer()), "total", len(n.host.Network().Peers()), "dir", c.Stat().Direction)
 
+	if backoff := n.host.DialBackoff(); backoff != nil {
+		backoff.RecordSuccess(c.RemotePeer())
+	}
+
 	if err := n.host.Peerstore().Put(c.RemotePeer(), peerstoreKeyConnectedAt, time.Now()); err != nil {
 		slog.Warn("Failed to store connection timestamp in peerstore", tele.LogAttrError(err))
 	}
@@ -176,6 +180,9 @@ func (n *Node) handleNewConnection(pid peer.ID) {
 			return
 		}
 		// the handshake failed, we disconnect and remove it from our pool
+		if backoff := n.host.DialBackoff(); backoff != nil {
+			backoff.RecordRefusal(pid)
+		}
 		ps.RemovePeer(pid)
 		_ = n.host.Network().ClosePeer(pid)
 	}
