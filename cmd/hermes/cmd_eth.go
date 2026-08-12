@@ -425,6 +425,7 @@ func cmdEthAction(c *cli.Context) error {
 		DirectConnections: rootConfig.DirectConnections,
 		Validation: eth.ValidationConfig{
 			Mode:       eth.ValidationMode(rootConfig.ValidationMode),
+			FailOpen:   rootConfig.ValidationFailOpen,
 			SlotWindow: rootConfig.ValidationSlotWindow,
 		},
 		// PubSub config
