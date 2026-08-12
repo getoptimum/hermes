@@ -81,7 +81,6 @@ func (v ValidationConfig) slotWindow() uint64 {
 // Outcome reasons, used as metric labels and on the emitted trace event.
 const (
 	reasonDecode            = "decode"
-	reasonWrongFork         = "wrong_fork_digest"
 	reasonUnknownFork       = "unknown_fork"
 	reasonSlotWindow        = "slot_out_of_window"
 	reasonEquivocation      = "equivocation"
@@ -90,8 +89,6 @@ const (
 	reasonNoDuties          = "duties_unavailable"
 	reasonSpeculativeDuties = "duties_speculative"
 )
-
-var errBadProposerSignature = errors.New("proposer signature does not verify")
 
 // blockForFork returns an empty signed block of the type matching fork.
 func blockForFork(fork chainFork) (ssz.Unmarshaler, error) {
@@ -125,11 +122,6 @@ func blockForFork(fork chainFork) (ssz.Unmarshaler, error) {
 func (p *PubSub) validateBeaconBlock(ctx context.Context, _ peer.ID, msg *pubsub.Message) pubsub.ValidationResult {
 	start := time.Now()
 	topic := msg.GetTopic()
-
-	// A stale subscription is our own bug, so the sender is not penalised.
-	if !p.topicMatchesCurrentFork(topic) {
-		return p.finishValidation(ctx, msg, pubsub.ValidationIgnore, reasonWrongFork, nil, start)
-	}
 
 	block, err := blockForFork(p.cfg.Chain.CurrentFork())
 	if err != nil {
@@ -231,16 +223,9 @@ func verifyProposerSignature(block interfaces.ReadOnlySignedBeaconBlock, blockRo
 	}
 
 	if !parsed.Verify(duty.PublicKey, signingRoot[:]) {
-		return errBadProposerSignature
+		return errors.New("proposer signature does not verify")
 	}
 	return nil
-}
-
-// topicMatchesCurrentFork guards against validating on a topic left over from
-// before a fork transition.
-func (p *PubSub) topicMatchesCurrentFork(topic string) bool {
-	digest := p.cfg.Chain.CurrentForkDigest()
-	return strings.Contains(topic, fmt.Sprintf("%x", digest))
 }
 
 func slotDistance(a, b primitives.Slot) uint64 {

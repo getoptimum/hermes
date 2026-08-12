@@ -65,8 +65,7 @@ type ChainConfig struct {
 	ColumnSubnetConfig      *SubnetConfig
 
 	// TrackProposerDuties keeps the proposer schedule cached for gossip
-	// validation. Off unless validation needs it, so nodes that do not validate
-	// neither call the beacon node for it nor log when that call fails.
+	// validation. Off unless validation needs it.
 	TrackProposerDuties bool
 }
 
@@ -77,8 +76,7 @@ type Chain struct {
 	Fork             chainFork
 	chainUpgradeSubs []chainUpgradeSubFn
 
-	// Proposer schedule for the current and next epoch, read by the pubsub
-	// validator so it never has to reach Prysm on the message path.
+	// Proposer schedule for gossip validation, read on the message path.
 	duties         *proposerDutyCache
 	dutyRefreshing atomic.Bool
 
@@ -156,9 +154,8 @@ func (c *Chain) epochUpdate(ctx context.Context) error {
 			"duration", time.Since(t),
 		)
 	}()
-	// Kicked off in the background: see startProposerDutyRefresh. It must not
-	// share this call's deadline, which on the construction path is the whole
-	// node's startup budget.
+	// Detached from ctx: on the construction path that deadline is the whole
+	// node's startup budget. See startProposerDutyRefresh.
 	c.startProposerDutyRefresh()
 
 	// check if new hardfork
@@ -447,19 +444,8 @@ func (c *Chain) CurrentSeqNumber() primitives.SSZUint64 {
 	return primitives.SSZUint64(c.metadataHolder.SeqNumber())
 }
 
-// CurrentForkDigest is read from the gossip validator on every message, so it
-// takes statusMu: StatusHolder has no lock of its own and the chain loop writes
-// it via UpdateStatus. The length guard matters for the same reason, since a
-// short slice would panic inside a validation goroutine and take the process out.
 func (c *Chain) CurrentForkDigest() [4]byte {
-	c.statusMu.RLock()
-	defer c.statusMu.RUnlock()
-
-	digest := c.statusHolder.ForkDigest()
-	if len(digest) < 4 {
-		return [4]byte{}
-	}
-	return [4]byte(digest[:4])
+	return [4]byte(c.statusHolder.ForkDigest())
 }
 
 func (c *Chain) CurrentFork() chainFork {

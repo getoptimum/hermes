@@ -103,7 +103,7 @@ func (d *DialBackoff) RecordRefusal(p peer.ID) {
 
 	entry.failures++
 	penalty := dialBackoffBase << min(entry.failures-1, 16)
-	if penalty > d.max || penalty <= 0 {
+	if penalty > d.max {
 		penalty = d.max
 	}
 	entry.until = time.Now().Add(penalty)

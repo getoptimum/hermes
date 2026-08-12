@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -93,19 +94,10 @@ func (c *proposerDutyCache) store(epoch primitives.Epoch, ed *epochDuties, keep 
 	c.epochs[epoch] = ed
 
 	for cached := range c.epochs {
-		if !containsEpoch(keep, cached) {
+		if !slices.Contains(keep, cached) {
 			delete(c.epochs, cached)
 		}
 	}
-}
-
-func containsEpoch(epochs []primitives.Epoch, target primitives.Epoch) bool {
-	for _, e := range epochs {
-		if e == target {
-			return true
-		}
-	}
-	return false
 }
 
 // ProposerDutyForSlot exposes the cached schedule to the pubsub validator.

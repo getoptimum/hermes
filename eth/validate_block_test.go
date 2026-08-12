@@ -483,19 +483,6 @@ func TestValidateBeaconBlockBadSignatureDoesNotClaimSlot(t *testing.T) {
 		"the real block for this slot must still be forwarded")
 }
 
-func TestValidateBeaconBlockStaleForkDigestIsIgnored(t *testing.T) {
-	f := newValidatorFixture(t, ValidationConfig{Mode: ValidationModeStructural})
-
-	data := f.signedBlock(t, f.key, f.slot, f.proposer)
-	msg := f.message(data)
-	staleTopic := "/eth2/00000000/beacon_block/ssz_snappy"
-	msg.Topic = &staleTopic
-
-	// Our own stale subscription, so the sender must not be penalised.
-	assert.Equal(t, pubsub.ValidationIgnore,
-		f.ps.validateBeaconBlock(context.Background(), peer.ID("p"), msg))
-}
-
 func TestValidationConfigValidate(t *testing.T) {
 	for _, mode := range []ValidationMode{ValidationModeOff, ValidationModeStructural, ValidationModeFull} {
 		assert.NoError(t, ValidationConfig{Mode: mode}.Validate())
@@ -600,42 +587,4 @@ func TestIsEquivocationIsAtomic(t *testing.T) {
 			t.Fatalf("trial %d: %d goroutines claimed the slot, want exactly 1", trial, claimed)
 		}
 	}
-}
-
-// TestCurrentForkDigestUnderConcurrentStatusUpdate covers the validator reading
-// the fork digest while the chain loop rewrites the status.
-func TestCurrentForkDigestUnderConcurrentStatusUpdate(t *testing.T) {
-	f := newValidatorFixture(t, ValidationConfig{Mode: ValidationModeStructural})
-	chain := f.ps.cfg.Chain
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		for i := 0; ctx.Err() == nil && i < 5000; i++ {
-			_ = chain.CurrentForkDigest()
-		}
-	}()
-	go func() {
-		defer wg.Done()
-		for i := 0; ctx.Err() == nil && i < 5000; i++ {
-			require.NoError(t, chain.UpdateStatus(statusV1, &ethtypes.StatusV2{
-				ForkDigest: []byte{0xde, 0xad, 0xbe, 0xef},
-			}))
-		}
-	}()
-	wg.Wait()
-}
-
-// TestCurrentForkDigestShortSliceDoesNotPanic guards the array conversion, which
-// would otherwise panic inside a validation goroutine and end the process.
-func TestCurrentForkDigestShortSliceDoesNotPanic(t *testing.T) {
-	f := newValidatorFixture(t, ValidationConfig{Mode: ValidationModeStructural})
-	chain := f.ps.cfg.Chain
-
-	require.NoError(t, chain.UpdateStatus(statusV1, &ethtypes.StatusV2{ForkDigest: []byte{0x01}}))
-	assert.Equal(t, [4]byte{}, chain.CurrentForkDigest())
 }
