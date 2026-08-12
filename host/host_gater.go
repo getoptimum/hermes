@@ -42,40 +42,30 @@ func newCompositeGater(gaters ...connmgr.ConnectionGater) connmgr.ConnectionGate
 	return &compositeGater{gaters: present}
 }
 
-func (cg *compositeGater) InterceptPeerDial(p peer.ID) bool {
+// allow reports whether every delegate permits the connection.
+func (cg *compositeGater) allow(fn func(connmgr.ConnectionGater) bool) bool {
 	for _, g := range cg.gaters {
-		if !g.InterceptPeerDial(p) {
+		if !fn(g) {
 			return false
 		}
 	}
 	return true
+}
+
+func (cg *compositeGater) InterceptPeerDial(p peer.ID) bool {
+	return cg.allow(func(g connmgr.ConnectionGater) bool { return g.InterceptPeerDial(p) })
 }
 
 func (cg *compositeGater) InterceptAddrDial(p peer.ID, addr ma.Multiaddr) bool {
-	for _, g := range cg.gaters {
-		if !g.InterceptAddrDial(p, addr) {
-			return false
-		}
-	}
-	return true
+	return cg.allow(func(g connmgr.ConnectionGater) bool { return g.InterceptAddrDial(p, addr) })
 }
 
 func (cg *compositeGater) InterceptAccept(conn network.ConnMultiaddrs) bool {
-	for _, g := range cg.gaters {
-		if !g.InterceptAccept(conn) {
-			return false
-		}
-	}
-	return true
+	return cg.allow(func(g connmgr.ConnectionGater) bool { return g.InterceptAccept(conn) })
 }
 
 func (cg *compositeGater) InterceptSecured(direction network.Direction, p peer.ID, conn network.ConnMultiaddrs) bool {
-	for _, g := range cg.gaters {
-		if !g.InterceptSecured(direction, p, conn) {
-			return false
-		}
-	}
-	return true
+	return cg.allow(func(g connmgr.ConnectionGater) bool { return g.InterceptSecured(direction, p, conn) })
 }
 
 func (cg *compositeGater) InterceptUpgraded(conn network.Conn) (bool, control.DisconnectReason) {
