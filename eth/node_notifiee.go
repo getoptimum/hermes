@@ -148,6 +148,13 @@ func (n *Node) handleNewConnection(pid peer.ID) {
 					slog.Warn("Failed to store handshaked marker in peerstore", tele.LogAttrError(err))
 				}
 
+				// Cleared here, not on Connected: a connection that fails the
+				// handshake is not a success, and clearing it there would reset the
+				// count so repeated failures never escalated.
+				if backoff := n.host.DialBackoff(); backoff != nil {
+					backoff.RecordSuccess(pid)
+				}
+
 				slog.Info(
 					"Performed successful handshake",
 					tele.LogAttrPeerID(pid),
@@ -176,6 +183,9 @@ func (n *Node) handleNewConnection(pid peer.ID) {
 			return
 		}
 		// the handshake failed, we disconnect and remove it from our pool
+		if backoff := n.host.DialBackoff(); backoff != nil {
+			backoff.RecordRefusal(pid)
+		}
 		ps.RemovePeer(pid)
 		_ = n.host.Network().ClosePeer(pid)
 	}

@@ -2,10 +2,12 @@ package eth
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/p2p/net/swarm"
 	"github.com/thejerf/suture/v4"
 
 	"github.com/probe-lab/hermes/host"
@@ -69,8 +71,18 @@ func (p *PeerDialer) Serve(ctx context.Context) error {
 			// finally, start the connection establishment.
 			// The success case is handled in net_notifiee.go.
 			timeoutCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-			_ = p.host.Connect(timeoutCtx, newPeer.AddrInfo) // ignore error, this happens all the time
+			err := p.host.Connect(timeoutCtx, newPeer.AddrInfo) // failures happen all the time
 			cancel()
+
+			// A failed dial is the only signal that a peer does not want us, so it
+			// is what the backoff keys on. Our own gater vetoing the dial is not
+			// such a signal: the peer was never contacted, and counting it would
+			// let the backoff escalate from our retries alone.
+			if err != nil && !errors.Is(err, swarm.ErrGaterDisallowedConnection) {
+				if backoff := p.host.DialBackoff(); backoff != nil {
+					backoff.RecordRefusal(newPeer.AddrInfo.ID)
+				}
+			}
 
 		case network.Connected:
 			continue // the peer is already connected
