@@ -43,6 +43,15 @@ func (p PubSubConfig) Validate() error {
 		return err
 	}
 
+	// The validator dereferences these on every message, where a nil would panic a
+	// gossipsub validation goroutine and take the process down, so fail at startup
+	// instead.
+	if p.Validation.enabled() {
+		if p.Chain == nil || p.Chain.cfg == nil || p.Chain.cfg.GenesisConfig == nil {
+			return fmt.Errorf("validation requires a chain with a genesis configuration")
+		}
+	}
+
 	if p.SecondsPerSlot == 0 {
 		return fmt.Errorf("seconds per slot must not be 0")
 	}
@@ -68,6 +77,10 @@ type PubSub struct {
 	// different block for the same slot can be spotted without a beacon state.
 	seenBlocks *lru.Cache[string, [32]byte]
 	meters     *validationMeters
+
+	// withheldC carries trace events for messages the validator did not forward,
+	// so emitting them cannot block a validation worker.
+	withheldC chan *host.TraceEvent
 }
 
 func NewPubSub(h *host.Host, cfg *PubSubConfig) (*PubSub, error) {
@@ -95,6 +108,7 @@ func NewPubSub(h *host.Host, cfg *PubSubConfig) (*PubSub, error) {
 		cfg:        cfg,
 		dsr:        dsr,
 		seenBlocks: seenBlocks,
+		withheldC:  make(chan *host.TraceEvent, withheldQueueSize),
 	}
 
 	if err := ps.initValidationMetrics(cfg.Meter); err != nil {
@@ -110,6 +124,10 @@ func (p *PubSub) Serve(ctx context.Context) error {
 	}
 
 	supervisor := suture.NewSimple("pubsub")
+
+	if p.cfg.Validation.enabled() {
+		go p.serveWithheldEvents(ctx)
+	}
 
 	for _, topicName := range p.cfg.Topics {
 		// Register before joining: a validator attached after the first message

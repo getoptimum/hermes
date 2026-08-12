@@ -32,6 +32,12 @@ type dialBackoffEntry struct {
 	until    time.Time
 }
 
+// dialBackoffForget is how long after a backoff expires a peer keeps its failure
+// count. Without it `failures` is a lifetime counter rather than the consecutive
+// count the escalation assumes, and a peer that refuses us once every few hours
+// would eventually be treated as permanently hostile.
+const dialBackoffForget = 2 * time.Hour
+
 // DialBackoff suppresses redials to peers that recently refused us.
 //
 // It keys on connection-level refusals, which are observable. It deliberately
@@ -84,10 +90,25 @@ func (d *DialBackoff) RecordRefusal(p peer.ID) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
+	now := time.Now()
+
 	entry, ok := d.entries.Get(p)
 	if !ok {
 		entry = &dialBackoffEntry{}
 		d.entries.Add(p, entry)
+	}
+
+	// A dial we blocked ourselves never reached the peer, so it says nothing about
+	// whether the peer still refuses us. Counting it would let the backoff escalate
+	// itself to the cap purely from our own retries.
+	if now.Before(entry.until) {
+		return
+	}
+
+	// Consecutive means consecutive: drop a stale count so escalation reflects
+	// recent behaviour rather than the peer's whole history.
+	if !entry.until.IsZero() && now.Sub(entry.until) > dialBackoffForget {
+		entry.failures = 0
 	}
 
 	entry.failures++

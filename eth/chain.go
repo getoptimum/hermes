@@ -62,6 +62,11 @@ type ChainConfig struct {
 	AttestationSubnetConfig *SubnetConfig
 	SyncSubnetConfig        *SubnetConfig
 	ColumnSubnetConfig      *SubnetConfig
+
+	// TrackProposerDuties keeps the proposer schedule cached for gossip
+	// validation. Off unless validation needs it, so nodes that do not validate
+	// neither call the beacon node for it nor log when that call fails.
+	TrackProposerDuties bool
 }
 
 type Chain struct {
@@ -439,8 +444,19 @@ func (c *Chain) CurrentSeqNumber() primitives.SSZUint64 {
 	return primitives.SSZUint64(c.metadataHolder.SeqNumber())
 }
 
+// CurrentForkDigest is read from the gossip validator on every message, so it
+// takes statusMu: StatusHolder has no lock of its own and the chain loop writes
+// it via UpdateStatus. The length guard matters for the same reason, since a
+// short slice would panic inside a validation goroutine and take the process out.
 func (c *Chain) CurrentForkDigest() [4]byte {
-	return [4]byte(c.statusHolder.ForkDigest())
+	c.statusMu.RLock()
+	defer c.statusMu.RUnlock()
+
+	digest := c.statusHolder.ForkDigest()
+	if len(digest) < 4 {
+		return [4]byte{}
+	}
+	return [4]byte(digest[:4])
 }
 
 func (c *Chain) CurrentFork() chainFork {

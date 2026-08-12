@@ -291,10 +291,17 @@ type ProposerDuty struct {
 	PublicKey bls.PublicKey
 }
 
+// proposerDutiesPaths are tried in order. v2 only exists from Prysm v7.1.5, and
+// the beacon-API spec has no v2 variant at all, so v1 is kept as the fallback:
+// without it a beacon node older than v7.1.5, or a rollback to one, would leave
+// the duty cache permanently empty and silently disable proposer and signature
+// checking. Both routes return the same response shape.
+var proposerDutiesPaths = []string{
+	"/eth/v2/validator/duties/proposer/%d",
+	"/eth/v1/validator/duties/proposer/%d",
+}
+
 // ProposerDuties returns the proposer schedule for epoch, keyed by slot.
-//
-// Deliberately the v2 route: Prysm v7 serves both, but marks v1 deprecated, so
-// v1 is the one that will eventually be removed.
 func (p *PrysmClient) ProposerDuties(ctx context.Context, epoch primitives.Epoch) (duties map[primitives.Slot]ProposerDuty, err error) {
 	ctx, span := p.tracer.Start(ctx, "prysm_client.proposer_duties", trace.WithAttributes(attribute.Int64("epoch", int64(epoch))))
 	defer func() {
@@ -305,14 +312,35 @@ func (p *PrysmClient) ProposerDuties(ctx context.Context, epoch primitives.Epoch
 		span.End()
 	}()
 
+	ctx, cancel := context.WithTimeout(ctx, p.timeout)
+	defer cancel()
+
+	var errs []error
+	for _, path := range proposerDutiesPaths {
+		duties, err = p.proposerDutiesFrom(ctx, fmt.Sprintf(path, epoch))
+		if err == nil {
+			return duties, nil
+		}
+		errs = append(errs, err)
+		// Only a missing route is worth retrying on the older path; anything else
+		// (auth, unavailable, transport) would fail identically.
+		if !errors.Is(err, errRouteNotFound) {
+			break
+		}
+	}
+
+	return nil, fmt.Errorf("proposer duties for epoch %d: %w", epoch, errors.Join(errs...))
+}
+
+// errRouteNotFound marks a beacon node that does not serve the requested path.
+var errRouteNotFound = errors.New("route not found")
+
+func (p *PrysmClient) proposerDutiesFrom(ctx context.Context, path string) (map[primitives.Slot]ProposerDuty, error) {
 	u := url.URL{
 		Scheme: p.scheme,
 		Host:   fmt.Sprintf("%s:%d", p.host, p.port),
-		Path:   fmt.Sprintf("/eth/v2/validator/duties/proposer/%d", epoch),
+		Path:   path,
 	}
-
-	ctx, cancel := context.WithTimeout(ctx, p.timeout)
-	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
@@ -325,7 +353,11 @@ func (p *PrysmClient) ProposerDuties(ctx context.Context, epoch primitives.Epoch
 	}
 	defer logDeferErr(resp.Body.Close, "Failed closing body")
 
-	if resp.StatusCode != http.StatusOK {
+	switch resp.StatusCode {
+	case http.StatusOK:
+	case http.StatusNotFound, http.StatusMethodNotAllowed:
+		return nil, fmt.Errorf("%s: %w", path, errRouteNotFound)
+	default:
 		return nil, parseErrorResponse(resp)
 	}
 
@@ -339,7 +371,7 @@ func (p *PrysmClient) ProposerDuties(ctx context.Context, epoch primitives.Epoch
 		return nil, fmt.Errorf("failed unmarshalling response data: %w", err)
 	}
 
-	duties = make(map[primitives.Slot]ProposerDuty, len(dutiesResp.Data))
+	duties := make(map[primitives.Slot]ProposerDuty, len(dutiesResp.Data))
 	for _, d := range dutiesResp.Data {
 		slot, err := strconv.ParseUint(d.Slot, 10, 64)
 		if err != nil {

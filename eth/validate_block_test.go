@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/hex"
 	"net/http"
+	"sync"
 	"testing"
 	"time"
 
@@ -35,10 +36,13 @@ const blockTopic = "/eth2/" + testForkDigest + "/beacon_block/ssz_snappy"
 // assert that a withheld message is still observed.
 type recordingDataStream struct {
 	host.NoopDataStream
+	mu     sync.Mutex
 	events []*host.TraceEvent
 }
 
 func (r *recordingDataStream) PutRecord(_ context.Context, evt *host.TraceEvent) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.events = append(r.events, evt)
 	return nil
 }
@@ -119,6 +123,7 @@ func newValidatorFixture(t *testing.T, cfg ValidationConfig) *validatorFixture {
 			Validation:     cfg,
 		},
 		seenBlocks: seen,
+		withheldC:  make(chan *host.TraceEvent, withheldQueueSize),
 	}
 
 	return &validatorFixture{
@@ -131,8 +136,14 @@ func newValidatorFixture(t *testing.T, cfg ValidationConfig) *validatorFixture {
 	}
 }
 
-// primeDuties fills the cache the way the chain's epoch loop would.
+// primeDuties fills the cache the way the chain's epoch loop would, with an
+// authoritative (non-speculative) entry.
 func (f *validatorFixture) primeDuties(t *testing.T, index primitives.ValidatorIndex, pub bls.PublicKey) {
+	t.Helper()
+	f.primeDutiesWith(t, index, pub, false)
+}
+
+func (f *validatorFixture) primeDutiesWith(t *testing.T, index primitives.ValidatorIndex, pub bls.PublicKey, speculative bool) {
 	t.Helper()
 
 	epoch := slots.ToEpoch(f.slot)
@@ -140,8 +151,24 @@ func (f *validatorFixture) primeDuties(t *testing.T, index primitives.ValidatorI
 		duties: map[primitives.Slot]ProposerDuty{
 			f.slot: {Index: index, PublicKey: pub},
 		},
-		domain: f.domain,
+		domain:      f.domain,
+		speculative: speculative,
 	}, []primitives.Epoch{epoch})
+}
+
+// withheldEvents drains the events the validator queued. The validator must never
+// block on the data stream, so it hands events to a channel rather than writing
+// them; the drain goroutine is exercised separately.
+func (f *validatorFixture) withheldEvents() []*host.TraceEvent {
+	var out []*host.TraceEvent
+	for {
+		select {
+		case evt := <-f.ps.withheldC:
+			out = append(out, evt)
+		default:
+			return out
+		}
+	}
 }
 
 // signedBlock builds a Deneb block for the given slot, signed by key.
@@ -291,11 +318,12 @@ func TestValidateBeaconBlock(t *testing.T) {
 			got := f.ps.validateBeaconBlock(context.Background(), peer.ID("test-peer"), f.message(data))
 			assert.Equal(t, tt.want, got)
 
+			events := f.withheldEvents()
 			if tt.wantRecord {
-				require.Len(t, f.stream.events, 1, "a withheld message must still be recorded")
-				assert.Equal(t, eventTypeWithheldMessage, f.stream.events[0].Type)
+				require.Len(t, events, 1, "a withheld message must still be recorded")
+				assert.Equal(t, eventTypeWithheldMessage, events[0].Type)
 			} else {
-				assert.Empty(t, f.stream.events, "accepted messages are recorded by the handler, not the validator")
+				assert.Empty(t, events, "accepted messages are recorded by the handler, not the validator")
 			}
 		})
 	}
@@ -323,19 +351,115 @@ func TestValidateBeaconBlockDutiesUnavailable(t *testing.T) {
 	}
 }
 
+// TestValidateBeaconBlockEquivocation covers a genuinely equivocating proposer:
+// two correctly signed blocks for one slot. Only the first is propagated, and the
+// second is ignored rather than rejected.
 func TestValidateBeaconBlockEquivocation(t *testing.T) {
-	f := newValidatorFixture(t, ValidationConfig{Mode: ValidationModeStructural})
+	f := newValidatorFixture(t, ValidationConfig{Mode: ValidationModeFull, FailOpen: true})
 	f.primeDuties(t, f.proposer, f.key.PublicKey())
 
 	first := f.signedBlock(t, f.key, f.slot, f.proposer)
 	assert.Equal(t, pubsub.ValidationAccept,
 		f.ps.validateBeaconBlock(context.Background(), peer.ID("p"), f.message(first)))
 
-	// A second, different block for the same slot and proposer. Per spec only the
-	// first is propagated, and the duplicate is ignored rather than rejected.
 	second := f.signedBlockWithGraffiti(t, f.key, f.slot, f.proposer, "different")
 	assert.Equal(t, pubsub.ValidationIgnore,
 		f.ps.validateBeaconBlock(context.Background(), peer.ID("p"), f.message(second)))
+}
+
+// TestValidateBeaconBlockUnverifiedCannotClaimSlot is the censorship regression
+// test. Whenever the signature was not actually verified, an unverified block must
+// not take the (slot, proposer) entry, or one forged message per slot would stop
+// the genuine block being forwarded. Covers the two paths where that applies:
+// structural mode, and full mode falling open on a cold cache.
+func TestValidateBeaconBlockUnverifiedCannotClaimSlot(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		cfg  ValidationConfig
+	}{
+		{name: "structural mode", cfg: ValidationConfig{Mode: ValidationModeStructural}},
+		{name: "full mode with cold duty cache", cfg: ValidationConfig{Mode: ValidationModeFull, FailOpen: true}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			wrongKey, err := bls.RandKey()
+			require.NoError(t, err)
+
+			f := newValidatorFixture(t, tt.cfg)
+
+			// The proposer schedule is public, so an attacker can name the right index.
+			forged := f.signedBlockWithGraffiti(t, wrongKey, f.slot, f.proposer, "forged")
+			f.ps.validateBeaconBlock(context.Background(), peer.ID("attacker"), f.message(forged))
+
+			genuine := f.signedBlock(t, f.key, f.slot, f.proposer)
+			assert.Equal(t, pubsub.ValidationAccept,
+				f.ps.validateBeaconBlock(context.Background(), peer.ID("honest"), f.message(genuine)),
+				"the genuine block for this slot must still be forwarded")
+		})
+	}
+}
+
+// TestValidateBeaconBlockSpeculativeDutiesNeverReject covers next-epoch duties,
+// which the beacon node derives from the current epoch's state and which can
+// therefore be wrong. They may confirm a block but must never condemn one.
+func TestValidateBeaconBlockSpeculativeDutiesNeverReject(t *testing.T) {
+	f := newValidatorFixture(t, ValidationConfig{Mode: ValidationModeFull, FailOpen: true})
+	// A speculative entry naming the wrong proposer.
+	f.primeDutiesWith(t, primitives.ValidatorIndex(999), f.key.PublicKey(), true)
+
+	data := f.signedBlock(t, f.key, f.slot, f.proposer)
+	assert.Equal(t, pubsub.ValidationAccept,
+		f.ps.validateBeaconBlock(context.Background(), peer.ID("p"), f.message(data)),
+		"a speculative schedule must not produce a reject")
+
+	// The same disagreement from an authoritative entry is a reject.
+	f2 := newValidatorFixture(t, ValidationConfig{Mode: ValidationModeFull, FailOpen: true})
+	f2.primeDutiesWith(t, primitives.ValidatorIndex(999), f2.key.PublicKey(), false)
+	data2 := f2.signedBlock(t, f2.key, f2.slot, f2.proposer)
+	assert.Equal(t, pubsub.ValidationReject,
+		f2.ps.validateBeaconBlock(context.Background(), peer.ID("p"), f2.message(data2)))
+}
+
+// TestValidateBeaconBlockWithheldEventsReachTheStream exercises the drain
+// goroutine, since the validator itself only queues.
+func TestValidateBeaconBlockWithheldEventsReachTheStream(t *testing.T) {
+	f := newValidatorFixture(t, ValidationConfig{Mode: ValidationModeStructural})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go f.ps.serveWithheldEvents(ctx)
+
+	bad := f.signedBlock(t, f.key, f.slot, f.proposer)
+	bad = bad[:len(bad)/2]
+	require.Equal(t, pubsub.ValidationReject,
+		f.ps.validateBeaconBlock(ctx, peer.ID("p"), f.message(bad)))
+
+	require.Eventually(t, func() bool {
+		f.stream.mu.Lock()
+		defer f.stream.mu.Unlock()
+		return len(f.stream.events) == 1
+	}, 2*time.Second, 10*time.Millisecond, "the withheld event should reach the data stream")
+}
+
+// TestEmitWithheldMessageNeverBlocks is the guard on the no-I/O invariant for the
+// telemetry path: a full queue must drop rather than park a validation worker.
+func TestEmitWithheldMessageNeverBlocks(t *testing.T) {
+	f := newValidatorFixture(t, ValidationConfig{Mode: ValidationModeStructural})
+
+	// Nothing is draining, so fill the queue past capacity.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < withheldQueueSize*3; i++ {
+			f.ps.emitWithheldMessage(context.Background(), f.message([]byte("x")), "reject", reasonDecode, nil)
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("emitWithheldMessage blocked with a full queue")
+	}
+	assert.Len(t, f.withheldEvents(), withheldQueueSize)
 }
 
 // TestValidateBeaconBlockBadSignatureDoesNotClaimSlot is a regression test. The
@@ -437,4 +561,82 @@ func newTestBlockDeneb() *ethtypes.SignedBeaconBlockDeneb {
 			},
 		},
 	}
+}
+
+// TestIsEquivocationIsAtomic covers the case the check exists for: an
+// equivocating proposer publishing two blocks at once, arriving on separate
+// validation workers. Exactly one may claim the slot, so a non-atomic
+// read-modify-write would let both through precisely when it matters.
+func TestIsEquivocationIsAtomic(t *testing.T) {
+	const goroutines = 32
+
+	for trial := 0; trial < 200; trial++ {
+		f := newValidatorFixture(t, ValidationConfig{Mode: ValidationModeFull})
+
+		var (
+			wg      sync.WaitGroup
+			mu      sync.Mutex
+			claimed int
+			start   = make(chan struct{})
+		)
+
+		for i := 0; i < goroutines; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				root := [32]byte{byte(i)}
+				<-start
+				if !f.ps.isEquivocation(f.slot, f.proposer, root) {
+					mu.Lock()
+					claimed++
+					mu.Unlock()
+				}
+			}(i)
+		}
+
+		close(start)
+		wg.Wait()
+
+		if claimed != 1 {
+			t.Fatalf("trial %d: %d goroutines claimed the slot, want exactly 1", trial, claimed)
+		}
+	}
+}
+
+// TestCurrentForkDigestUnderConcurrentStatusUpdate covers the validator reading
+// the fork digest while the chain loop rewrites the status.
+func TestCurrentForkDigestUnderConcurrentStatusUpdate(t *testing.T) {
+	f := newValidatorFixture(t, ValidationConfig{Mode: ValidationModeStructural})
+	chain := f.ps.cfg.Chain
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; ctx.Err() == nil && i < 5000; i++ {
+			_ = chain.CurrentForkDigest()
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; ctx.Err() == nil && i < 5000; i++ {
+			require.NoError(t, chain.UpdateStatus(statusV1, &ethtypes.StatusV2{
+				ForkDigest: []byte{0xde, 0xad, 0xbe, 0xef},
+			}))
+		}
+	}()
+	wg.Wait()
+}
+
+// TestCurrentForkDigestShortSliceDoesNotPanic guards the array conversion, which
+// would otherwise panic inside a validation goroutine and end the process.
+func TestCurrentForkDigestShortSliceDoesNotPanic(t *testing.T) {
+	f := newValidatorFixture(t, ValidationConfig{Mode: ValidationModeStructural})
+	chain := f.ps.cfg.Chain
+
+	require.NoError(t, chain.UpdateStatus(statusV1, &ethtypes.StatusV2{ForkDigest: []byte{0x01}}))
+	assert.Equal(t, [4]byte{}, chain.CurrentForkDigest())
 }

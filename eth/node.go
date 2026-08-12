@@ -206,6 +206,8 @@ func NewNode(cfg *NodeConfig) (*Node, error) {
 		AttestationSubnetConfig: attConfig,
 		SyncSubnetConfig:        syncConfig,
 		ColumnSubnetConfig:      columConfig,
+		// Only full validation consults the proposer schedule.
+		TrackProposerDuties: cfg.Validation.Mode == ValidationModeFull,
 	}
 	chain, err := NewChain(ctx, chainCfg)
 	if err != nil {

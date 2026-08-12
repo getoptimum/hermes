@@ -24,9 +24,10 @@ const eventTypeWithheldMessage = "WITHHELD_MESSAGE"
 // record is a no-op until initValidationMetrics runs, which keeps the validator
 // usable in tests that construct a PubSub directly.
 type validationMeters struct {
-	results  metric.Int64Counter
-	degraded metric.Int64Counter
-	duration metric.Float64Histogram
+	results         metric.Int64Counter
+	degraded        metric.Int64Counter
+	duration        metric.Float64Histogram
+	withheldDropped metric.Int64Counter
 }
 
 func (p *PubSub) initValidationMetrics(meter metric.Meter) error {
@@ -59,7 +60,20 @@ func (p *PubSub) initValidationMetrics(meter metric.Meter) error {
 		return err
 	}
 
-	p.meters = &validationMeters{results: results, degraded: degraded, duration: duration}
+	withheldDropped, err := meter.Int64Counter(
+		"validation_withheld_dropped_total",
+		metric.WithDescription("Withheld-message events dropped because the data stream was not keeping up"),
+	)
+	if err != nil {
+		return err
+	}
+
+	p.meters = &validationMeters{
+		results:         results,
+		degraded:        degraded,
+		duration:        duration,
+		withheldDropped: withheldDropped,
+	}
 	return nil
 }
 
@@ -128,6 +142,32 @@ func (p *PubSub) recordDegraded(ctx context.Context, topic, reason string) {
 	))
 }
 
+// withheldQueueSize bounds the backlog of withheld-message events. Small on
+// purpose: this exists to keep the validator off the data stream's critical
+// path, not to guarantee delivery.
+const withheldQueueSize = 256
+
+// serveWithheldEvents drains withheld-message events into the data stream.
+//
+// This is a separate goroutine because DataStream.PutRecord can block, for an
+// unbounded time on some sinks, and the validator must never block: it runs on
+// gossipsub's validation workers, so a stalled sink would consume validation
+// slots and eventually make pubsub drop messages on every topic. A peer flooding
+// undecodable payloads must not be able to do that.
+func (p *PubSub) serveWithheldEvents(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case evt := <-p.withheldC:
+			if err := p.cfg.DataStream.PutRecord(ctx, evt); err != nil {
+				slog.Warn("failed putting withheld message event",
+					"topic", evt.Topic, tele.LogAttrError(err))
+			}
+		}
+	}
+}
+
 // emitWithheldMessage records a message that was not forwarded. It builds the
 // event from raw gossip metadata rather than the decoded object, because the
 // most interesting case is precisely the one that failed to decode.
@@ -153,12 +193,18 @@ func (p *PubSub) emitWithheldMessage(ctx context.Context, msg *pubsub.Message, r
 		Payload:   payload,
 	}
 
-	if err := p.cfg.DataStream.PutRecord(ctx, evt); err != nil {
-		slog.Warn(
-			"failed putting withheld message event",
-			"topic", msg.GetTopic(),
-			"reason", reason,
-			"err", tele.LogAttrError(err),
-		)
+	// Non-blocking by design: see serveWithheldEvents. Dropping an observation is
+	// strictly better than stalling a validation worker, and the drop is counted.
+	select {
+	case p.withheldC <- evt:
+	default:
+		if p.meters != nil {
+			p.meters.withheldDropped.Add(ctx, 1, metric.WithAttributes(
+				attribute.String("topic", msg.GetTopic()),
+				attribute.String("reason", reason),
+			))
+		}
+		slog.Debug("dropped withheld message event, queue full",
+			"topic", msg.GetTopic(), "reason", reason)
 	}
 }

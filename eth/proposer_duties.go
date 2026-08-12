@@ -2,6 +2,7 @@ package eth
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -14,12 +15,23 @@ import (
 	"github.com/probe-lab/hermes/tele"
 )
 
+// dutyEpochsRetained is how many epochs of proposer schedule to keep: the
+// previous one so a block from the tail of it is still checkable, the current
+// one, and the next as a warm cache for the rollover.
+const dutyEpochsRetained = 3
+
 // epochDuties is the proposer schedule for one epoch plus its signing domain.
 // The domain costs a hash to derive and only changes per epoch, so it is
 // computed here rather than per message.
 type epochDuties struct {
 	duties map[primitives.Slot]ProposerDuty
 	domain []byte
+
+	// speculative means this was fetched before its epoch began. The beacon node
+	// answers such a request from the state at the start of the *current* epoch,
+	// so the assignment can still change at the epoch transition. Good enough to
+	// confirm a block, never good enough to reject one.
+	speculative bool
 }
 
 // proposerDutyCache serves the proposer schedule to gossip validation without
@@ -33,13 +45,13 @@ type proposerDutyCache struct {
 }
 
 func newProposerDutyCache() *proposerDutyCache {
-	return &proposerDutyCache{epochs: make(map[primitives.Epoch]*epochDuties, 2)}
+	return &proposerDutyCache{epochs: make(map[primitives.Epoch]*epochDuties, dutyEpochsRetained)}
 }
 
-// Lookup returns the duty and signing domain for slot. The bool is false when
-// the epoch has not been fetched, which callers must treat as "cannot verify"
-// rather than "invalid".
-func (c *proposerDutyCache) Lookup(slot primitives.Slot) (ProposerDuty, []byte, bool) {
+// Lookup returns the duty and signing domain for slot, and whether the entry is
+// authoritative. `ok` false means "cannot verify", which callers must not treat
+// as "invalid".
+func (c *proposerDutyCache) Lookup(slot primitives.Slot) (duty ProposerDuty, domain []byte, ok, authoritative bool) {
 	epoch := slots.ToEpoch(slot)
 
 	c.mu.RLock()
@@ -47,26 +59,32 @@ func (c *proposerDutyCache) Lookup(slot primitives.Slot) (ProposerDuty, []byte, 
 
 	ed, ok := c.epochs[epoch]
 	if !ok {
-		return ProposerDuty{}, nil, false
+		return ProposerDuty{}, nil, false, false
 	}
 
-	duty, ok := ed.duties[slot]
+	duty, ok = ed.duties[slot]
 	if !ok {
-		return ProposerDuty{}, nil, false
+		return ProposerDuty{}, nil, false, false
 	}
 
-	return duty, ed.domain, true
+	return duty, ed.domain, true, !ed.speculative
 }
 
-func (c *proposerDutyCache) has(epoch primitives.Epoch) bool {
+// needsFetch reports whether epoch is missing, or cached only as a speculative
+// prediction that has since become current and should be replaced.
+func (c *proposerDutyCache) needsFetch(epoch, currentEpoch primitives.Epoch) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	_, ok := c.epochs[epoch]
-	return ok
+
+	ed, ok := c.epochs[epoch]
+	if !ok {
+		return true
+	}
+	return ed.speculative && epoch <= currentEpoch
 }
 
-// store inserts the epoch and drops any epoch outside keep, bounding the cache
-// to the epochs the slot window can still reach.
+// store inserts the epoch and drops anything outside keep, bounding the cache to
+// the epochs the slot window can still reach.
 func (c *proposerDutyCache) store(epoch primitives.Epoch, ed *epochDuties, keep []primitives.Epoch) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -90,23 +108,33 @@ func containsEpoch(epochs []primitives.Epoch, target primitives.Epoch) bool {
 }
 
 // ProposerDutyForSlot exposes the cached schedule to the pubsub validator.
-func (c *Chain) ProposerDutyForSlot(slot primitives.Slot) (ProposerDuty, []byte, bool) {
+func (c *Chain) ProposerDutyForSlot(slot primitives.Slot) (ProposerDuty, []byte, bool, bool) {
 	return c.duties.Lookup(slot)
 }
 
-// refreshProposerDuties keeps the current and next epoch cached. Fetching the
-// next epoch ahead of time removes the epoch-boundary race where a block
-// arrives before its schedule does.
+// refreshProposerDuties keeps the previous, current and next epoch cached.
+// Fetching ahead removes the epoch-boundary gap where a block arrives before its
+// schedule does; the next-epoch entry is marked speculative and re-fetched once
+// that epoch is current, because the prediction is not binding.
 //
-// Errors are returned for logging only; a stale cache degrades validation to
-// the structural checks rather than stalling relay.
+// Errors are returned for logging only; a stale cache degrades validation to the
+// structural checks rather than stalling relay.
 func (c *Chain) refreshProposerDuties(ctx context.Context) error {
+	if !c.cfg.TrackProposerDuties {
+		return nil
+	}
+
 	currentEpoch := slots.ToEpoch(slots.CurrentSlot(c.cfg.GenesisConfig.GenesisTime))
-	wanted := []primitives.Epoch{currentEpoch, currentEpoch + 1}
+
+	wanted := make([]primitives.Epoch, 0, dutyEpochsRetained)
+	if currentEpoch > 0 {
+		wanted = append(wanted, currentEpoch-1)
+	}
+	wanted = append(wanted, currentEpoch, currentEpoch+1)
 
 	var errs []error
 	for _, epoch := range wanted {
-		if c.duties.has(epoch) {
+		if !c.duties.needsFetch(epoch, currentEpoch) {
 			continue
 		}
 
@@ -116,12 +144,14 @@ func (c *Chain) refreshProposerDuties(ctx context.Context) error {
 			continue
 		}
 
+		ed.speculative = epoch > currentEpoch
 		c.duties.store(epoch, ed, wanted)
-		slog.Debug("cached proposer duties", "epoch", epoch, "slots", len(ed.duties))
+		slog.Debug("cached proposer duties",
+			"epoch", epoch, "slots", len(ed.duties), "speculative", ed.speculative)
 	}
 
 	if len(errs) > 0 {
-		return fmt.Errorf("refresh proposer duties: %w", errs[0])
+		return fmt.Errorf("refresh proposer duties: %w", errors.Join(errs...))
 	}
 	return nil
 }
@@ -146,7 +176,7 @@ func (c *Chain) fetchEpochDuties(ctx context.Context, epoch primitives.Epoch) (*
 }
 
 // logProposerDutyRefresh runs the refresh and swallows the error after logging,
-// so a Prysm outage never takes down the chain loop.
+// so a beacon node outage never takes down the chain loop.
 func (c *Chain) logProposerDutyRefresh(ctx context.Context) {
 	if err := c.refreshProposerDuties(ctx); err != nil {
 		slog.Warn("failed refreshing proposer duties, validation will degrade", tele.LogAttrError(err))

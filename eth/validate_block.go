@@ -59,7 +59,9 @@ type ValidationConfig struct {
 
 func (v ValidationConfig) Validate() error {
 	switch v.Mode {
-	case ValidationModeOff, ValidationModeStructural, ValidationModeFull:
+	// The empty string is the zero value of the struct, so it means "unset", which
+	// must behave as off rather than failing a node that never opted in.
+	case "", ValidationModeOff, ValidationModeStructural, ValidationModeFull:
 		return nil
 	default:
 		return fmt.Errorf("invalid validation mode %q, want off, structural or full", v.Mode)
@@ -79,13 +81,15 @@ func (v ValidationConfig) slotWindow() uint64 {
 
 // Outcome reasons, used as metric labels and on the emitted trace event.
 const (
-	reasonDecode        = "decode"
-	reasonWrongFork     = "wrong_fork_digest"
-	reasonSlotWindow    = "slot_out_of_window"
-	reasonEquivocation  = "equivocation"
-	reasonProposerIndex = "wrong_proposer_index"
-	reasonSignature     = "bad_proposer_signature"
-	reasonNoDuties      = "duties_unavailable"
+	reasonDecode            = "decode"
+	reasonWrongFork         = "wrong_fork_digest"
+	reasonUnknownFork       = "unknown_fork"
+	reasonSlotWindow        = "slot_out_of_window"
+	reasonEquivocation      = "equivocation"
+	reasonProposerIndex     = "wrong_proposer_index"
+	reasonSignature         = "bad_proposer_signature"
+	reasonNoDuties          = "duties_unavailable"
+	reasonSpeculativeDuties = "duties_speculative"
 )
 
 var errBadProposerSignature = errors.New("proposer signature does not verify")
@@ -134,7 +138,7 @@ func (p *PubSub) validateBeaconBlock(ctx context.Context, _ peer.ID, msg *pubsub
 	block, err := blockForFork(p.cfg.Chain.CurrentFork())
 	if err != nil {
 		slog.Warn("cannot validate block for unknown fork", "topic", topic, tele.LogAttrError(err))
-		return p.finishValidation(ctx, msg, pubsub.ValidationIgnore, reasonWrongFork, err, start)
+		return p.finishValidation(ctx, msg, pubsub.ValidationIgnore, reasonUnknownFork, err, start)
 	}
 
 	if err := p.cfg.Encoder.DecodeGossip(msg.Data, block); err != nil {
@@ -162,30 +166,52 @@ func (p *PubSub) validateBeaconBlock(ctx context.Context, _ peer.ID, msg *pubsub
 
 	proposerIndex := wrapped.Block().ProposerIndex()
 
+	// signatureVerified gates the equivocation check below. Without a verified
+	// signature there is no way to tell a forged block from the real one, and
+	// recording the forgery's root first would get the real block for that slot
+	// ignored as a duplicate: cheap censorship, one message per slot.
+	signatureVerified := false
+
 	if p.cfg.Validation.Mode == ValidationModeFull {
-		duty, domain, ok := p.cfg.Chain.ProposerDutyForSlot(slot)
+		duty, domain, ok, authoritative := p.cfg.Chain.ProposerDutyForSlot(slot)
+		sigErr := error(nil)
+		if ok {
+			if duty.Index != proposerIndex {
+				sigErr = fmt.Errorf("expected proposer %d, got %d", duty.Index, proposerIndex)
+			} else {
+				sigErr = verifyProposerSignature(wrapped, blockRoot, domain, duty)
+			}
+		}
+
 		switch {
 		case !ok:
-			// Cannot verify: no cached schedule for this slot.
+			// No cached schedule for this slot.
 			p.recordDegraded(ctx, topic, reasonNoDuties)
 			if !p.cfg.Validation.FailOpen {
 				return p.finishValidation(ctx, msg, pubsub.ValidationIgnore, reasonNoDuties, nil, start)
 			}
 
+		case sigErr == nil:
+			signatureVerified = true
+
+		case !authoritative:
+			// A speculative schedule disagreeing is not evidence of a bad block:
+			// the prediction itself may be what is wrong, so never reject on it.
+			p.recordDegraded(ctx, topic, reasonSpeculativeDuties)
+			if !p.cfg.Validation.FailOpen {
+				return p.finishValidation(ctx, msg, pubsub.ValidationIgnore, reasonSpeculativeDuties, sigErr, start)
+			}
+
 		case duty.Index != proposerIndex:
-			return p.finishValidation(ctx, msg, pubsub.ValidationReject, reasonProposerIndex, nil, start)
+			return p.finishValidation(ctx, msg, pubsub.ValidationReject, reasonProposerIndex, sigErr, start)
 
 		default:
-			if err := verifyProposerSignature(wrapped, blockRoot, domain, duty); err != nil {
-				return p.finishValidation(ctx, msg, pubsub.ValidationReject, reasonSignature, err, start)
-			}
+			return p.finishValidation(ctx, msg, pubsub.ValidationReject, reasonSignature, sigErr, start)
 		}
 	}
 
-	// Last, so only a block that survived the checks above can claim the slot.
-	// Recording earlier would let one badly signed block poison the entry and get
-	// the real block for that slot ignored as a duplicate.
-	if p.isEquivocation(slot, proposerIndex, blockRoot) {
+	// Only a block whose signature was actually verified may claim its slot.
+	if signatureVerified && p.isEquivocation(slot, proposerIndex, blockRoot) {
 		return p.finishValidation(ctx, msg, pubsub.ValidationIgnore, reasonEquivocation, nil, start)
 	}
 
@@ -233,15 +259,15 @@ func slotDistance(a, b primitives.Slot) uint64 {
 
 // isEquivocation reports whether a different block was already seen for this
 // slot and proposer, recording the first one otherwise.
+//
+// PeekOrAdd rather than Get-then-Add: validators run concurrently, and the case
+// this check exists for is a proposer publishing two blocks at once, so a
+// non-atomic read-modify-write would let both through exactly when it matters.
 func (p *PubSub) isEquivocation(slot primitives.Slot, proposerIndex primitives.ValidatorIndex, root [32]byte) bool {
 	key := fmt.Sprintf("%d/%d", slot, proposerIndex)
 
-	if seen, ok := p.seenBlocks.Get(key); ok {
-		return seen != root
-	}
-
-	p.seenBlocks.Add(key, root)
-	return false
+	seen, ok, _ := p.seenBlocks.PeekOrAdd(key, root)
+	return ok && seen != root
 }
 
 func newSeenBlockCache() (*lru.Cache[string, [32]byte], error) {
