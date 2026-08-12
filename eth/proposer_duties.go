@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/core/signing"
 	"github.com/OffchainLabs/prysm/v7/config/params"
@@ -162,6 +163,12 @@ func (c *Chain) fetchEpochDuties(ctx context.Context, epoch primitives.Epoch) (*
 		return nil, err
 	}
 
+	// A syncing beacon node answers 200 with an empty schedule. Caching that would
+	// stick for the whole epoch, since a present entry is never refetched.
+	if len(duties) == 0 {
+		return nil, fmt.Errorf("empty proposer schedule")
+	}
+
 	fork, err := params.Fork(epoch)
 	if err != nil {
 		return nil, fmt.Errorf("fork for epoch: %w", err)
@@ -175,10 +182,36 @@ func (c *Chain) fetchEpochDuties(ctx context.Context, epoch primitives.Epoch) (*
 	return &epochDuties{duties: duties, domain: domain}, nil
 }
 
-// logProposerDutyRefresh runs the refresh and swallows the error after logging,
-// so a beacon node outage never takes down the chain loop.
-func (c *Chain) logProposerDutyRefresh(ctx context.Context) {
-	if err := c.refreshProposerDuties(ctx); err != nil {
-		slog.Warn("failed refreshing proposer duties, validation will degrade", tele.LogAttrError(err))
+// dutyRefreshTimeout bounds one refresh pass. Generous because it covers up to
+// three sequential requests to a beacon node that may be remote.
+const dutyRefreshTimeout = 30 * time.Second
+
+// startProposerDutyRefresh refreshes the schedule in the background.
+//
+// Deliberately detached from the caller's context. epochUpdate runs on the
+// construction path, where NewNode shares one 10s deadline across the whole
+// handshake, so doing this inline could both delay startup and burn the budget
+// that the following ChainHead call needs, turning a slow beacon node into a
+// node that will not start. Errors only degrade validation, so they are never
+// worth failing on.
+func (c *Chain) startProposerDutyRefresh() {
+	if !c.cfg.TrackProposerDuties {
+		return
 	}
+
+	// One in flight at a time, in case a refresh outlives the epoch tick.
+	if !c.dutyRefreshing.CompareAndSwap(false, true) {
+		return
+	}
+
+	go func() {
+		defer c.dutyRefreshing.Store(false)
+
+		ctx, cancel := context.WithTimeout(context.Background(), dutyRefreshTimeout)
+		defer cancel()
+
+		if err := c.refreshProposerDuties(ctx); err != nil {
+			slog.Warn("failed refreshing proposer duties, validation will degrade", tele.LogAttrError(err))
+		}
+	}()
 }

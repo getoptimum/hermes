@@ -15,14 +15,11 @@ import (
 	"github.com/probe-lab/hermes/tele"
 )
 
-// eventTypeWithheldMessage marks a message hermes declined to forward. It is
-// deliberately distinct from HANDLE_MESSAGE so consumers can tell an observed
-// message from a suppressed one.
+// Distinct from HANDLE_MESSAGE so consumers can tell an observed message from a
+// suppressed one.
 const eventTypeWithheldMessage = "WITHHELD_MESSAGE"
 
-// validationMeters holds the gossip validation instruments. Nil-safe: every
-// record is a no-op until initValidationMetrics runs, which keeps the validator
-// usable in tests that construct a PubSub directly.
+// Nil until initValidationMetrics runs, so every record site is nil-checked.
 type validationMeters struct {
 	results         metric.Int64Counter
 	degraded        metric.Int64Counter
@@ -98,9 +95,8 @@ func validationResultLabel(result pubsub.ValidationResult) string {
 	}
 }
 
-// finishValidation records the outcome and, for anything not forwarded, still
-// emits a trace event. hermes exists to observe, so suppressing a message must
-// not also erase the record of it.
+// finishValidation records the outcome, and still emits a trace event for
+// anything withheld: suppressing a message must not erase the record of it.
 func (p *PubSub) finishValidation(
 	ctx context.Context,
 	msg *pubsub.Message,
@@ -147,13 +143,9 @@ func (p *PubSub) recordDegraded(ctx context.Context, topic, reason string) {
 // path, not to guarantee delivery.
 const withheldQueueSize = 256
 
-// serveWithheldEvents drains withheld-message events into the data stream.
-//
-// This is a separate goroutine because DataStream.PutRecord can block, for an
-// unbounded time on some sinks, and the validator must never block: it runs on
-// gossipsub's validation workers, so a stalled sink would consume validation
-// slots and eventually make pubsub drop messages on every topic. A peer flooding
-// undecodable payloads must not be able to do that.
+// serveWithheldEvents drains withheld-message events into the data stream. Its own
+// goroutine because PutRecord can block indefinitely, and the validator runs on
+// gossipsub's workers: a stalled sink there would starve validation on every topic.
 func (p *PubSub) serveWithheldEvents(ctx context.Context) {
 	for {
 		select {
@@ -168,9 +160,8 @@ func (p *PubSub) serveWithheldEvents(ctx context.Context) {
 	}
 }
 
-// emitWithheldMessage records a message that was not forwarded. It builds the
-// event from raw gossip metadata rather than the decoded object, because the
-// most interesting case is precisely the one that failed to decode.
+// Built from raw gossip metadata rather than the decoded object, because the most
+// interesting case is the one that failed to decode.
 func (p *PubSub) emitWithheldMessage(ctx context.Context, msg *pubsub.Message, result, reason string, cause error) {
 	payload := map[string]any{
 		"PeerID":  p.localID().String(),

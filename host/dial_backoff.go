@@ -15,14 +15,10 @@ import (
 )
 
 const (
-	// dialBackoffBase is the first penalty applied to a peer that refused us.
-	// Deliberately short: a refusal is usually transient, most often the remote
-	// being at its inbound peer limit, and banning a good peer for hours over
-	// that would cost us more than the wasted dial does.
+	// First penalty after a refusal. Short because a refusal is usually transient,
+	// most often the remote being at its inbound peer limit.
 	dialBackoffBase = time.Minute
-	// dialBackoffCacheSize bounds how many peers we remember. The dialer churns
-	// through far more than max-peers, so this is sized for the churn, not the
-	// connection count.
+	// Sized for dialer churn rather than the connection count.
 	dialBackoffCacheSize = 4096
 )
 
@@ -38,13 +34,9 @@ type dialBackoffEntry struct {
 // would eventually be treated as permanently hostile.
 const dialBackoffForget = 2 * time.Hour
 
-// DialBackoff suppresses redials to peers that recently refused us.
-//
-// It keys on connection-level refusals, which are observable. It deliberately
-// does not try to infer gossip rejection: there is no REJECT on the wire, a peer
-// silently debits a local score, and by the time we could infer anything the
-// penalty has already been applied. So this reduces wasted dials and peer-pool
-// churn; it does not prevent scoring penalties.
+// DialBackoff suppresses redials to peers that recently refused us, keyed on
+// connection-level failures. It cannot infer gossip rejection, which is not
+// observable on the wire, so it reduces wasted dials but prevents no scoring.
 type DialBackoff struct {
 	mu      sync.Mutex
 	entries *lru.Cache[peer.ID, *dialBackoffEntry]
@@ -98,15 +90,13 @@ func (d *DialBackoff) RecordRefusal(p peer.ID) {
 		d.entries.Add(p, entry)
 	}
 
-	// A dial we blocked ourselves never reached the peer, so it says nothing about
-	// whether the peer still refuses us. Counting it would let the backoff escalate
-	// itself to the cap purely from our own retries.
+	// A dial we blocked ourselves never reached the peer, so counting it would let
+	// the backoff escalate from our own retries alone.
 	if now.Before(entry.until) {
 		return
 	}
 
-	// Consecutive means consecutive: drop a stale count so escalation reflects
-	// recent behaviour rather than the peer's whole history.
+	// Drop a stale count so escalation reflects recent behaviour, not all history.
 	if !entry.until.IsZero() && now.Sub(entry.until) > dialBackoffForget {
 		entry.failures = 0
 	}

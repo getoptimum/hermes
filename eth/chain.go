@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/OffchainLabs/prysm/v7/config/params"
@@ -78,7 +79,8 @@ type Chain struct {
 
 	// Proposer schedule for the current and next epoch, read by the pubsub
 	// validator so it never has to reach Prysm on the message path.
-	duties *proposerDutyCache
+	duties         *proposerDutyCache
+	dutyRefreshing atomic.Bool
 
 	// TODO:
 	// - DataColumn Cache
@@ -154,9 +156,10 @@ func (c *Chain) epochUpdate(ctx context.Context) error {
 			"duration", time.Since(t),
 		)
 	}()
-	// Refresh before the chain head call so a ChainHead failure cannot starve
-	// the duty cache and silently degrade validation.
-	c.logProposerDutyRefresh(ctx)
+	// Kicked off in the background: see startProposerDutyRefresh. It must not
+	// share this call's deadline, which on the construction path is the whole
+	// node's startup budget.
+	c.startProposerDutyRefresh()
 
 	// check if new hardfork
 	slog.Info("Getting Prysm's chain head...")

@@ -50,9 +50,8 @@ const equivocationCacheSize = 256
 // ValidationConfig configures the gossip validator.
 type ValidationConfig struct {
 	Mode ValidationMode
-	// FailOpen forwards a block whose structural checks passed but which could
-	// not be fully verified, typically because Prysm is unreachable and the duty
-	// cache is cold. The floor is then upstream behaviour rather than a stall.
+	// FailOpen forwards structurally valid blocks that could not be fully verified,
+	// so a beacon node outage degrades rather than stalls relay.
 	FailOpen   bool
 	SlotWindow uint64
 }
@@ -118,14 +117,11 @@ func blockForFork(fork chainFork) (ssz.Unmarshaler, error) {
 
 // validateBeaconBlock is the gossipsub topic validator for beacon_block.
 //
-// It performs no I/O. The proposer schedule it consults is filled on the chain's
-// epoch loop; a cache miss degrades to the structural checks and never triggers a
-// fetch, since the beacon node may be remote and blocking here would put its
-// round trip directly on the propagation path.
+// Performs no I/O: the schedule comes from the chain's epoch loop, and a miss
+// degrades to the structural checks rather than fetching.
 //
-// REJECT is reserved for provably bad messages, since it debits the sender's
-// score. Anything hermes merely cannot confirm returns IGNORE, which still
-// withholds the message from the mesh but costs the sender nothing.
+// REJECT debits the sender's score, so it is reserved for provably bad messages;
+// anything merely unconfirmable returns IGNORE.
 func (p *PubSub) validateBeaconBlock(ctx context.Context, _ peer.ID, msg *pubsub.Message) pubsub.ValidationResult {
 	start := time.Now()
 	topic := msg.GetTopic()
@@ -166,10 +162,8 @@ func (p *PubSub) validateBeaconBlock(ctx context.Context, _ peer.ID, msg *pubsub
 
 	proposerIndex := wrapped.Block().ProposerIndex()
 
-	// signatureVerified gates the equivocation check below. Without a verified
-	// signature there is no way to tell a forged block from the real one, and
-	// recording the forgery's root first would get the real block for that slot
-	// ignored as a duplicate: cheap censorship, one message per slot.
+	// Gates the equivocation check: without a verified signature a forged block
+	// could claim the slot and get the real one ignored as a duplicate.
 	signatureVerified := false
 
 	if p.cfg.Validation.Mode == ValidationModeFull {
@@ -195,8 +189,7 @@ func (p *PubSub) validateBeaconBlock(ctx context.Context, _ peer.ID, msg *pubsub
 			signatureVerified = true
 
 		case !authoritative:
-			// A speculative schedule disagreeing is not evidence of a bad block:
-			// the prediction itself may be what is wrong, so never reject on it.
+			// The prediction may be what is wrong, so never reject on it.
 			p.recordDegraded(ctx, topic, reasonSpeculativeDuties)
 			if !p.cfg.Validation.FailOpen {
 				return p.finishValidation(ctx, msg, pubsub.ValidationIgnore, reasonSpeculativeDuties, sigErr, start)
@@ -257,12 +250,9 @@ func slotDistance(a, b primitives.Slot) uint64 {
 	return uint64(b - a)
 }
 
-// isEquivocation reports whether a different block was already seen for this
-// slot and proposer, recording the first one otherwise.
-//
-// PeekOrAdd rather than Get-then-Add: validators run concurrently, and the case
-// this check exists for is a proposer publishing two blocks at once, so a
-// non-atomic read-modify-write would let both through exactly when it matters.
+// isEquivocation reports whether a different block was already seen for this slot
+// and proposer. PeekOrAdd because validators run concurrently and a non-atomic
+// read-modify-write would let both blocks through.
 func (p *PubSub) isEquivocation(slot primitives.Slot, proposerIndex primitives.ValidatorIndex, root [32]byte) bool {
 	key := fmt.Sprintf("%d/%d", slot, proposerIndex)
 

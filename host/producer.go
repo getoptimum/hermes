@@ -20,9 +20,8 @@ type DataStreamRenderer interface {
 	RenderPayload(evt *TraceEvent, msg *pubsub.Message, dst ssz.Unmarshaler) (*TraceEvent, error)
 }
 
-// DecodedDataStreamRenderer is implemented by renderers that can render an
-// already-decoded payload, letting a caller that had to decode for other reasons
-// avoid paying for a second decode.
+// DecodedDataStreamRenderer renders an already-decoded payload, so a caller that
+// had to decode anyway does not pay for a second decode.
 type DecodedDataStreamRenderer interface {
 	RenderDecodedPayload(evt *TraceEvent, msg *pubsub.Message, dst ssz.Unmarshaler) (*TraceEvent, error)
 }

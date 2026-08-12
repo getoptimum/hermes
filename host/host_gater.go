@@ -22,9 +22,8 @@ func newDeferredGater() *deferredGater {
 	return &deferredGater{}
 }
 
-// compositeGater requires every delegate to allow a connection. Any one of them
-// vetoing is enough to block, so gaters can be composed without knowing about
-// each other.
+// compositeGater blocks if any delegate vetoes, so gaters compose without knowing
+// about each other.
 type compositeGater struct {
 	gaters []connmgr.ConnectionGater
 }

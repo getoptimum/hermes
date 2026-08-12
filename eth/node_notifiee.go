@@ -31,10 +31,6 @@ var _ network.Notifiee = (*Node)(nil)
 func (n *Node) Connected(net network.Network, c network.Conn) {
 	slog.Debug("Connected with peer", tele.LogAttrPeerID(c.RemotePeer()), "total", len(n.host.Network().Peers()), "dir", c.Stat().Direction)
 
-	if backoff := n.host.DialBackoff(); backoff != nil {
-		backoff.RecordSuccess(c.RemotePeer())
-	}
-
 	if err := n.host.Peerstore().Put(c.RemotePeer(), peerstoreKeyConnectedAt, time.Now()); err != nil {
 		slog.Warn("Failed to store connection timestamp in peerstore", tele.LogAttrError(err))
 	}
@@ -150,6 +146,13 @@ func (n *Node) handleNewConnection(pid peer.ID) {
 
 				if err := ps.Put(pid, peerstoreKeyIsHandshaked, true); err != nil {
 					slog.Warn("Failed to store handshaked marker in peerstore", tele.LogAttrError(err))
+				}
+
+				// Cleared here, not on Connected: a connection that fails the
+				// handshake is not a success, and clearing it there would reset the
+				// count so repeated failures never escalated.
+				if backoff := n.host.DialBackoff(); backoff != nil {
+					backoff.RecordSuccess(pid)
 				}
 
 				slog.Info(

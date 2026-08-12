@@ -134,6 +134,15 @@ func (n *NodeConfig) Validate() error {
 		return fmt.Errorf("genesis config must not be nil")
 	}
 
+	if err := n.Validation.Validate(); err != nil {
+		return err
+	}
+
+	// Only zero disables the backoff; a negative value would disable it silently.
+	if n.DialBackoffMax < 0 {
+		return fmt.Errorf("dial backoff max must not be negative, use 0 to disable")
+	}
+
 	if n.NetworkConfig == nil {
 		return fmt.Errorf("beacon network config must not be nil")
 	}

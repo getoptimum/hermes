@@ -50,7 +50,7 @@ func (r *recordingDataStream) PutRecord(_ context.Context, evt *host.TraceEvent)
 // explodingTransport fails the test if any HTTP request is attempted. This is
 // what enforces the invariant that the validator performs no I/O, so that a
 // remote or shared beacon node can never add its round trip to propagation.
-type explodingTransport struct{ t *testing.T }
+type explodingTransport struct{ t testing.TB }
 
 func (e *explodingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	e.t.Fatalf("validator performed network I/O: %s %s", req.Method, req.URL)
@@ -68,7 +68,7 @@ type validatorFixture struct {
 
 // newValidatorFixture wires a PubSub with a chain whose genesis is placed so
 // that `slot` is the current slot, and a Prysm client that cannot be used.
-func newValidatorFixture(t *testing.T, cfg ValidationConfig) *validatorFixture {
+func newValidatorFixture(t testing.TB, cfg ValidationConfig) *validatorFixture {
 	t.Helper()
 
 	const slot = primitives.Slot(1024)
@@ -138,12 +138,12 @@ func newValidatorFixture(t *testing.T, cfg ValidationConfig) *validatorFixture {
 
 // primeDuties fills the cache the way the chain's epoch loop would, with an
 // authoritative (non-speculative) entry.
-func (f *validatorFixture) primeDuties(t *testing.T, index primitives.ValidatorIndex, pub bls.PublicKey) {
+func (f *validatorFixture) primeDuties(t testing.TB, index primitives.ValidatorIndex, pub bls.PublicKey) {
 	t.Helper()
 	f.primeDutiesWith(t, index, pub, false)
 }
 
-func (f *validatorFixture) primeDutiesWith(t *testing.T, index primitives.ValidatorIndex, pub bls.PublicKey, speculative bool) {
+func (f *validatorFixture) primeDutiesWith(t testing.TB, index primitives.ValidatorIndex, pub bls.PublicKey, speculative bool) {
 	t.Helper()
 
 	epoch := slots.ToEpoch(f.slot)
@@ -172,13 +172,13 @@ func (f *validatorFixture) withheldEvents() []*host.TraceEvent {
 }
 
 // signedBlock builds a Deneb block for the given slot, signed by key.
-func (f *validatorFixture) signedBlock(t *testing.T, key bls.SecretKey, slot primitives.Slot, proposer primitives.ValidatorIndex) []byte {
+func (f *validatorFixture) signedBlock(t testing.TB, key bls.SecretKey, slot primitives.Slot, proposer primitives.ValidatorIndex) []byte {
 	return f.signedBlockWithGraffiti(t, key, slot, proposer, "")
 }
 
 // signedBlockWithGraffiti varies the block body so two blocks can share a slot
 // and proposer while hashing differently, which is what equivocation looks like.
-func (f *validatorFixture) signedBlockWithGraffiti(t *testing.T, key bls.SecretKey, slot primitives.Slot, proposer primitives.ValidatorIndex, graffiti string) []byte {
+func (f *validatorFixture) signedBlockWithGraffiti(t testing.TB, key bls.SecretKey, slot primitives.Slot, proposer primitives.ValidatorIndex, graffiti string) []byte {
 	t.Helper()
 
 	block := newTestBlockDeneb()
@@ -506,10 +506,9 @@ func TestValidationConfigValidate(t *testing.T) {
 func BenchmarkValidateBeaconBlock(b *testing.B) {
 	for _, mode := range []ValidationMode{ValidationModeStructural, ValidationModeFull} {
 		b.Run(string(mode), func(b *testing.B) {
-			t := &testing.T{}
-			f := newValidatorFixture(t, ValidationConfig{Mode: mode, FailOpen: true})
-			f.primeDuties(t, f.proposer, f.key.PublicKey())
-			data := f.signedBlock(t, f.key, f.slot, f.proposer)
+			f := newValidatorFixture(b, ValidationConfig{Mode: mode, FailOpen: true})
+			f.primeDuties(b, f.proposer, f.key.PublicKey())
+			data := f.signedBlock(b, f.key, f.slot, f.proposer)
 
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
