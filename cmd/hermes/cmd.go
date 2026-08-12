@@ -19,6 +19,7 @@ import (
 	"github.com/urfave/cli/v2"
 	"go.opentelemetry.io/otel"
 
+	"github.com/probe-lab/hermes/eth"
 	"github.com/probe-lab/hermes/host"
 	"github.com/probe-lab/hermes/tele"
 )
@@ -67,6 +68,8 @@ var rootConfig = struct {
 	FilterMode                  string
 	FilterPatterns              []string
 	DirectConnections           []string
+	ValidationMode              string
+	ValidationSlotWindow        uint64
 
 	// unexported fields are derived from the configuration
 	awsConfig *aws.Config
@@ -113,6 +116,8 @@ var rootConfig = struct {
 	FilterMode:                  "denylist",
 	FilterPatterns:              []string{"^hermes*"}, // avoid connecting to other hermes instances by default
 	DirectConnections:           nil,
+	ValidationMode:              string(eth.ValidationModeOff), // upstream behaviour: observe, never withhold
+	ValidationSlotWindow:        4,
 
 	// unexported fields are derived or initialized during startup
 	awsConfig:           nil,
@@ -373,6 +378,20 @@ var rootFlags = []cli.Flag{
 		Usage:       "Peer filter mode: disabled, denylist, or allowlist",
 		Value:       rootConfig.FilterMode,
 		Destination: &rootConfig.FilterMode,
+	},
+	&cli.StringFlag{
+		Name:        "validation.mode",
+		EnvVars:     []string{"HERMES_VALIDATION_MODE"},
+		Usage:       "Gossip validation depth: off or structural. structural stops hermes forwarding messages it can prove are malformed",
+		Value:       rootConfig.ValidationMode,
+		Destination: &rootConfig.ValidationMode,
+	},
+	&cli.Uint64Flag{
+		Name:        "validation.slot-window",
+		EnvVars:     []string{"HERMES_VALIDATION_SLOT_WINDOW"},
+		Usage:       "How many slots either side of the current slot a block may claim before it is ignored",
+		Value:       rootConfig.ValidationSlotWindow,
+		Destination: &rootConfig.ValidationSlotWindow,
 	},
 	&cli.StringSliceFlag{
 		Name:    "libp2p.filter.patterns",

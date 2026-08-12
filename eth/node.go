@@ -246,6 +246,8 @@ func NewNode(cfg *NodeConfig) (*Node, error) {
 		Encoder:        cfg.GossipSubMessageEncoder,
 		SecondsPerSlot: time.Duration(cfg.BeaconConfig.SecondsPerSlot) * time.Second,
 		DataStream:     ds,
+		Validation:     cfg.Validation,
+		Meter:          cfg.Meter,
 	}
 
 	pubSub, err := NewPubSub(h, pubSubConfig)

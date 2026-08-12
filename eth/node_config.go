@@ -119,12 +119,20 @@ type NodeConfig struct {
 
 	// DirectConnections ensurest that our host doesn't prune the connection from these nodes
 	DirectConnections []string
+
+	// Validation controls how much of a gossip message is checked before hermes
+	// forwards it. Off by default, which is upstream behaviour.
+	Validation ValidationConfig
 }
 
 // Validate validates the [NodeConfig] [Node] configuration.
 func (n *NodeConfig) Validate() error {
 	if n.GenesisConfig == nil {
 		return fmt.Errorf("genesis config must not be nil")
+	}
+
+	if err := n.Validation.Validate(); err != nil {
+		return err
 	}
 
 	if n.NetworkConfig == nil {
