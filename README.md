@@ -25,6 +25,7 @@ As of `2025-08-22`, Hermes supports the Ethereum, Filecoin, and OPStack-based ne
     * [Ethereum](#ethereum)
       * [Subnet Configuration](#subnet-configuration)
       * [Topic Subscription](#topic-subscription)
+      * [Gossip Validation](#gossip-validation)
     * [Filecoin](#filecoin)
       * [Hermes vs Filecoin Lite Nodes](#hermes-vs-filecoin-lite-nodes)
     * [Optimism](#optimism)
@@ -116,6 +117,12 @@ GLOBAL OPTIONS:
    --tracing             Whether to emit trace data (default: false) [$HERMES_TRACING_ENABLED]
    --tracing.addr value  Where to publish the traces to. (default: "localhost") [$HERMES_TRACING_ADDR]
    --tracing.port value  On which port does the traces collector listen (default: 4317) [$HERMES_TRACING_PORT]
+
+   Validation Configuration:
+
+   --validation.fail-open          Forward structurally valid messages that could not be fully verified, e.g. when the proposer duty cache is cold (default: true) [$HERMES_VALIDATION_FAIL_OPEN]
+   --validation.mode value         Gossip validation depth: off, structural, or full. Anything but off stops hermes forwarding messages it can prove are invalid (default: "off") [$HERMES_VALIDATION_MODE]
+   --validation.slot-window value  How many slots either side of the current slot a block may claim before it is ignored (default: 4) [$HERMES_VALIDATION_SLOT_WINDOW]
 
 ```
 
@@ -347,6 +354,41 @@ OPTIONS:
 
 </details>
 
+#### Gossip Validation
+
+By default Hermes forwards every gossip message and only decodes it afterwards, for
+observation. `--validation.mode` turns on a gossipsub topic validator for `beacon_block`, so
+Hermes stops propagating messages it can prove are invalid:
+
+| Mode | Behaviour |
+| --- | --- |
+| `off` (default) | Forward everything, decode afterwards. |
+| `structural` | Only the checks that need no external data. |
+| `full` | Adds the proposer and signature checks, which read the proposer schedule that the chain's epoch loop caches from the beacon node. |
+
+Messages that are provably bad are rejected, which debits the sender's gossip score.
+Anything Hermes merely cannot confirm is ignored instead:
+
+| Wrongness | Mode | Result | `reason` label |
+| --- | --- | --- | --- |
+| Not valid SSZ for the current fork's block type, or a nil block | structural | reject | `decode` |
+| Current fork has no known block type | structural | ignore | `unknown_fork` |
+| Claimed slot further from the current slot than the slot window | structural | ignore | `slot_out_of_window` |
+| Not the scheduled proposer for that slot | full | reject | `wrong_proposer_index` |
+| Proposer signature does not verify | full | reject | `bad_proposer_signature` |
+| A second, distinct block for the same slot and proposer | full | ignore | `equivocation` |
+| No cached schedule for the slot | full | ignore unless fail-open | `duties_unavailable` |
+| Mismatch against a next-epoch prediction | full | ignore unless fail-open | `duties_speculative` |
+
+`--validation.fail-open` (default `true`) forwards structurally valid blocks that could not
+be fully verified, so a beacon node outage degrades relay instead of stalling it.
+`--validation.slot-window` (default `4`) sets how far from the current slot a block may
+claim to be.
+
+Every message Hermes does not forward is still reported on the data stream as a
+`WITHHELD_MESSAGE` event, carrying the topic, message ID and size, the sender, and the
+result and reason above.
+
 ### Filecoin
 
 To run Hermes in the Filecoin network, no auxiliary infrastructure is needed.
@@ -447,6 +489,16 @@ Below is a list of projects and studies that have relied on Hermes as a networki
 ### Metrics
 
 When you provide the `--metrics` command line flag Hermes will expose a Prometheus HTTP endpoint at `localhost:6060`. Host and port are configurable via `--metrics.addr` and `--metrics.port`.
+
+With `--validation.mode` set to anything but `off`, the following instruments are exposed in
+addition to the libp2p and gossipsub ones:
+
+| Instrument | Labels |
+| --- | --- |
+| `validation_result_total` | `topic`, `result`, `reason` |
+| `validation_degraded_total` | `topic`, `reason` |
+| `validation_duration_seconds` | `topic`, `result` |
+| `validation_withheld_dropped_total` | `topic`, `reason` |
 
 ### Tracing
 
