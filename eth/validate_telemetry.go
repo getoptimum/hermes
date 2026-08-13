@@ -52,6 +52,15 @@ func (p *PubSub) initValidationMetrics(meter metric.Meter) error {
 		"validation_duration_seconds",
 		metric.WithDescription("Time spent in the gossip validator, which is time added to propagation"),
 		metric.WithUnit("s"),
+		// Explicit buckets because the SDK defaults start at 0 and jump to 5
+		// seconds, so every observation lands in one bucket and no percentile is
+		// recoverable. Validation is tens of microseconds for the structural
+		// checks and low milliseconds once signatures are verified.
+		metric.WithExplicitBucketBoundaries(
+			0.00005, 0.0001, 0.00025, 0.0005,
+			0.001, 0.0025, 0.005, 0.01,
+			0.025, 0.05, 0.1, 0.25,
+		),
 	)
 	if err != nil {
 		return err
