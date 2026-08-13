@@ -12,16 +12,14 @@ import (
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 )
 
-// The SDK's default histogram boundaries start at 0 and jump to 5 seconds, so a
-// sub-millisecond measurement puts every observation in one bucket and no
-// percentile survives. Exported through the real exporter so the layout is
-// observed rather than assumed.
+// Exported through the real Prometheus exporter, because the defect being guarded
+// is the exported bucket layout rather than anything the SDK reports.
 func TestValidationDurationHistogramResolvesSubMillisecond(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	exp, err := promexp.New(promexp.WithRegisterer(reg), promexp.WithNamespace("hermes"))
 	require.NoError(t, err)
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(exp))
-	t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
+	t.Cleanup(func() { require.NoError(t, mp.Shutdown(context.Background())) })
 
 	ps := &PubSub{}
 	require.NoError(t, ps.initValidationMetrics(mp.Meter("hermes")))
@@ -35,24 +33,24 @@ func TestValidationDurationHistogramResolvesSubMillisecond(t *testing.T) {
 	families, err := reg.Gather()
 	require.NoError(t, err)
 
-	var counts []uint64
+	counts := map[float64]uint64{}
 	for _, mf := range families {
 		if !strings.Contains(mf.GetName(), "validation_duration_seconds") {
 			continue
 		}
 		for _, m := range mf.GetMetric() {
 			for _, b := range m.GetHistogram().GetBucket() {
-				counts = append(counts, b.GetCumulativeCount())
+				counts[b.GetUpperBound()] = b.GetCumulativeCount()
 			}
 		}
 	}
 	require.NotEmpty(t, counts, "histogram was not exported")
 
-	// Distinct cumulative counts mean the observations landed in different buckets.
-	distinct := map[uint64]struct{}{}
-	for _, c := range counts {
-		distinct[c] = struct{}{}
+	// Cumulative counts at boundaries the two microsecond-scale samples straddle.
+	// On the SDK defaults these boundaries do not exist at all.
+	for bound, want := range map[float64]uint64{0.00005: 0, 0.0001: 1, 0.00025: 2, 0.05: 5} {
+		got, ok := counts[bound]
+		require.True(t, ok, "no bucket at le=%g; boundaries are %v", bound, counts)
+		assert.Equal(t, want, got, "cumulative count at le=%g", bound)
 	}
-	assert.GreaterOrEqual(t, len(distinct), 5,
-		"observations collapsed into too few buckets: %v", counts)
 }
