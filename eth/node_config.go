@@ -400,13 +400,6 @@ func (n *NodeConfig) pubsubOptions(subFilter pubsub.SubscriptionFilter, activeVa
 		pubsub.WithPeerScore(n.peerScoringParams(activeValidators)),
 		pubsub.WithGossipSubParams(pubsubGossipParam()),
 	}
-	if len(n.BlacklistPeers) > 0 {
-		list, err := n.BlacklistMultiaddrs()
-		if err != nil {
-			return psOpts
-		}
-		psOpts = append(psOpts, pubsub.WithBlacklist(host.NewPubsubBlacklist(list)))
-	}
 	return psOpts
 }
 
