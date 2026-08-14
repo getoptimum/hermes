@@ -235,6 +235,7 @@ func (h *Host) InitGossipSub(ctx context.Context, opts ...pubsub.Option) (*pubsu
 		pubsub.WithRawTracer(mt),
 		pubsub.WithEventTracer(h),
 		pubsub.WithPeerScoreInspect(h.UpdatePeerScore, h.sk.freq),
+		pubsub.WithBlacklist(h.cfg.PubsubBlacklist),
 	)
 
 	if h.cfg.PubsubBlacklist != nil {

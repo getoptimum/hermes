@@ -172,7 +172,7 @@ func (n *Node) handleNewConnection(pid peer.ID) {
 			"peer", pid.String(),
 			"err", err.Error(),
 		)
-		if slices.ContainsFunc(n.cfg.DirectMultiaddrs(), func(addr peer.AddrInfo) bool {
+		if slices.ContainsFunc(n.directConnections, func(addr peer.AddrInfo) bool {
 			return addr.ID.String() == pid.String()
 		}) {
 			slog.Warn(

@@ -429,6 +429,7 @@ func cmdEthAction(c *cli.Context) error {
 			FailOpen:   rootConfig.ValidationFailOpen,
 			SlotWindow: rootConfig.ValidationSlotWindow,
 		},
+		BlacklistPeers:    rootConfig.BlacklistPeers,
 		// PubSub config
 		PubSubSubscriptionRequestLimit: 200, // Prysm: beacon-chain/p2p/pubsub_filter.go#L22
 		PubSubMaxOutputQueue:           600, // Prysm: beacon-chain/p2p/config.go#L10

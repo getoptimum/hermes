@@ -72,6 +72,7 @@ var rootConfig = struct {
 	ValidationFailOpen          bool
 	ValidationSlotWindow        uint64
 	DialBackoffMax              time.Duration
+	BlacklistPeers              []string
 
 	// unexported fields are derived from the configuration
 	awsConfig *aws.Config
@@ -118,6 +119,7 @@ var rootConfig = struct {
 	FilterMode:                  "denylist",
 	FilterPatterns:              []string{"^hermes*"}, // avoid connecting to other hermes instances by default
 	DirectConnections:           nil,
+	BlacklistPeers:              nil,
 	ValidationMode:              string(eth.ValidationModeOff), // upstream behaviour: observe, never withhold
 	ValidationFailOpen:          true,
 	ValidationSlotWindow:        4,
@@ -426,6 +428,15 @@ var rootFlags = []cli.Flag{
 		Usage:   "Multiaddresses of the peers that we want to keep as direct connections",
 		Action: func(c *cli.Context, v []string) error {
 			rootConfig.DirectConnections = v
+			return nil
+		},
+	},
+	&cli.StringSliceFlag{
+		Name:    "libp2p.blacklist-peers",
+		EnvVars: []string{"HERMES_LIBP2P_BLACKLIST_PEERS"},
+		Usage:   "Multiaddresses of peer IDs to blacklist from GossipSub",
+		Action: func(c *cli.Context, v []string) error {
+			rootConfig.BlacklistPeers = v
 			return nil
 		},
 	},
