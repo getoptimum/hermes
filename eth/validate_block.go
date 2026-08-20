@@ -24,66 +24,69 @@ import (
 	"github.com/probe-lab/hermes/tele"
 )
 
-// ValidationMode selects how much of a gossip message hermes checks before it
+// MsgValidationMode selects how much of a gossip message hermes checks before it
 // forwards it on.
-type ValidationMode string
+type MsgValidationMode string
 
 const (
-	// ValidationModeOff keeps upstream behaviour: everything is forwarded, and
+	// MsgValidationModeOff keeps upstream behaviour: everything is forwarded, and
 	// only decoded afterwards for observation.
-	ValidationModeOff ValidationMode = "off"
-	// ValidationModeStructural runs only the checks needing no external data.
-	ValidationModeStructural ValidationMode = "structural"
-	// ValidationModeFull adds the proposer and signature checks, which depend on
+	MsgValidationModeOff MsgValidationMode = "off"
+	// MsgValidationModeStructural runs only the checks needing no external data.
+	MsgValidationModeStructural MsgValidationMode = "structural"
+	// MsgValidationModeFull adds the proposer and signature checks, which depend on
 	// the proposer schedule cached by the chain's epoch loop.
-	ValidationModeFull ValidationMode = "full"
+	MsgValidationModeFull MsgValidationMode = "full"
 )
 
 // defaultSlotWindow is how far from the current slot a block may claim to be
-// before it is ignored. Wide enough to absorb clock skew and a short reorg.
+// before it is ignored. Wide enough to absorb clock skew and a short reorg. A
+// configured 0 means this default, not "current slot only".
 const defaultSlotWindow = 4
 
 // equivocationCacheSize bounds the (slot, proposer) memory used to spot a second
 // distinct block for one slot. 256 covers eight epochs.
 const equivocationCacheSize = 256
 
-// ValidationConfig configures the gossip validator.
-type ValidationConfig struct {
-	Mode ValidationMode
+// MsgValidationConfig configures the gossip validator.
+type MsgValidationConfig struct {
+	Mode MsgValidationMode
 	// FailOpen forwards structurally valid blocks that could not be fully verified,
 	// so a beacon node outage degrades rather than stalls relay.
 	FailOpen   bool
 	SlotWindow uint64
 }
 
-func (v ValidationConfig) Validate() error {
+func (v MsgValidationConfig) Validate() error {
 	switch v.Mode {
 	// The empty string is the zero value of the struct, so it means "unset", which
 	// must behave as off rather than failing a node that never opted in.
-	case "", ValidationModeOff, ValidationModeStructural, ValidationModeFull:
+	case "", MsgValidationModeOff, MsgValidationModeStructural, MsgValidationModeFull:
 		return nil
 	default:
 		return fmt.Errorf("invalid validation mode %q, want off, structural or full", v.Mode)
 	}
 }
 
-func (v ValidationConfig) enabled() bool {
-	return v.Mode == ValidationModeStructural || v.Mode == ValidationModeFull
+func (v MsgValidationConfig) enabled() bool {
+	return v.Mode == MsgValidationModeStructural || v.Mode == MsgValidationModeFull
 }
 
-func (v ValidationConfig) slotWindow() uint64 {
+func (v MsgValidationConfig) slotWindow() uint64 {
 	if v.SlotWindow == 0 {
 		return defaultSlotWindow
 	}
 	return v.SlotWindow
 }
 
-// Outcome reasons, used as metric labels and on the emitted trace event.
+// Outcome reasons, used as metric labels.
 const (
 	reasonDecode            = "decode"
+	reasonInternal          = "internal_error"
 	reasonUnknownFork       = "unknown_fork"
 	reasonSlotWindow        = "slot_out_of_window"
 	reasonEquivocation      = "equivocation"
+	reasonEquivocationSpam  = "equivocation_spam"
 	reasonProposerIndex     = "wrong_proposer_index"
 	reasonSignature         = "bad_proposer_signature"
 	reasonNoDuties          = "duties_unavailable"
@@ -117,8 +120,10 @@ func blockForFork(fork chainFork) (ssz.Unmarshaler, error) {
 // Performs no I/O: the schedule comes from the chain's epoch loop, and a miss
 // degrades to the structural checks rather than fetching.
 //
-// REJECT debits the sender's score, so it is reserved for provably bad messages;
-// anything merely unconfirmable returns IGNORE.
+// REJECT debits the sender's score, so it is reserved for messages proven bad
+// against something the sender committed to. A failed decode is not one of those:
+// the container type comes from hermes' own view of the fork, so anything the
+// decode can prove is IGNOREd instead.
 func (p *PubSub) validateBeaconBlock(ctx context.Context, _ peer.ID, msg *pubsub.Message) pubsub.ValidationResult {
 	start := time.Now()
 	topic := msg.GetTopic()
@@ -130,63 +135,66 @@ func (p *PubSub) validateBeaconBlock(ctx context.Context, _ peer.ID, msg *pubsub
 	}
 
 	if err := p.cfg.Encoder.DecodeGossip(msg.Data, block); err != nil {
-		return p.finishValidation(ctx, msg, pubsub.ValidationReject, reasonDecode, err, start)
+		return p.finishValidation(ctx, msg, pubsub.ValidationIgnore, reasonDecode, err, start)
 	}
 
 	wrapped, err := blocks.NewSignedBeaconBlock(block)
 	if err != nil {
-		return p.finishValidation(ctx, msg, pubsub.ValidationReject, reasonDecode, err, start)
+		return p.finishValidation(ctx, msg, pubsub.ValidationIgnore, reasonDecode, err, start)
 	}
 	if wrapped.IsNil() || wrapped.Block().IsNil() {
-		return p.finishValidation(ctx, msg, pubsub.ValidationReject, reasonDecode, errors.New("nil block"), start)
+		return p.finishValidation(ctx, msg, pubsub.ValidationIgnore, reasonDecode, errors.New("nil block"), start)
 	}
 
 	slot := wrapped.Block().Slot()
 	currentSlot := slots.CurrentSlot(p.cfg.Chain.cfg.GenesisConfig.GenesisTime)
-	if slotDistance(slot, currentSlot) > p.cfg.Validation.slotWindow() {
+	if slotDistance(slot, currentSlot) > p.cfg.MsgValidation.slotWindow() {
 		return p.finishValidation(ctx, msg, pubsub.ValidationIgnore, reasonSlotWindow, nil, start)
 	}
 
 	proposerIndex := wrapped.Block().ProposerIndex()
 
-	// Gates the equivocation check: without a verified signature a forged block
-	// could claim the slot and get the real one ignored as a duplicate.
+	// Gates the equivocation check: an unverified block must not be able to claim
+	// a slot and have the real one reported as the equivocation.
 	signatureVerified := false
 	var blockRoot [32]byte
 
-	if p.cfg.Validation.Mode == ValidationModeFull {
-		// Merkleizing a full block is the most expensive step here, so it waits
-		// until something actually needs the root.
-		blockRoot, err = wrapped.Block().HashTreeRoot()
-		if err != nil {
-			return p.finishValidation(ctx, msg, pubsub.ValidationReject, reasonDecode, err, start)
-		}
-
+	if p.cfg.MsgValidation.Mode == MsgValidationModeFull {
 		duty, domain, ok, authoritative := p.cfg.Chain.ProposerDutyForSlot(slot)
 		sigErr := error(nil)
 		if ok {
 			if duty.Index != proposerIndex {
 				sigErr = fmt.Errorf("expected proposer %d, got %d", duty.Index, proposerIndex)
 			} else {
+				// Merkleizing is the most expensive step here, so it waits until the
+				// signature check is the only thing left.
+				blockRoot, err = wrapped.Block().HashTreeRoot()
+				if err != nil {
+					// Our hasher failing is not proof of a bad message, so it must
+					// not debit the sender.
+					return p.finishValidation(ctx, msg, pubsub.ValidationIgnore, reasonInternal, err, start)
+				}
 				sigErr = verifyProposerSignature(wrapped, blockRoot, domain, duty)
 			}
 		}
 
 		switch {
 		case !ok:
-			// No cached schedule for this slot.
-			p.recordDegraded(ctx, topic, reasonNoDuties)
-			if !p.cfg.Validation.FailOpen {
+			p.recordUnverifiedMsg(ctx, topic, reasonNoDuties)
+			if !p.cfg.MsgValidation.FailOpen {
 				return p.finishValidation(ctx, msg, pubsub.ValidationIgnore, reasonNoDuties, nil, start)
 			}
 
 		case sigErr == nil:
 			signatureVerified = true
 
+		case errors.Is(sigErr, errInternalSigning):
+			return p.finishValidation(ctx, msg, pubsub.ValidationIgnore, reasonInternal, sigErr, start)
+
 		case !authoritative:
 			// The prediction may be what is wrong, so never reject on it.
-			p.recordDegraded(ctx, topic, reasonSpeculativeDuties)
-			if !p.cfg.Validation.FailOpen {
+			p.recordUnverifiedMsg(ctx, topic, reasonSpeculativeDuties)
+			if !p.cfg.MsgValidation.FailOpen {
 				return p.finishValidation(ctx, msg, pubsub.ValidationIgnore, reasonSpeculativeDuties, sigErr, start)
 			}
 
@@ -198,17 +206,31 @@ func (p *PubSub) validateBeaconBlock(ctx context.Context, _ peer.ID, msg *pubsub
 		}
 	}
 
-	// Only a block whose signature was actually verified may claim its slot.
-	if signatureVerified && p.isEquivocation(slot, proposerIndex, blockRoot) {
-		return p.finishValidation(ctx, msg, pubsub.ValidationIgnore, reasonEquivocation, nil, start)
-	}
-
-	// Hand the decoded block to the subscription handler so the accept path
+	// Hand the decoded block to the subscription handler, so the accept path
 	// decodes exactly once.
 	msg.ValidatorData = block
 
+	// Only a block whose signature was actually verified may claim its slot.
+	if signatureVerified {
+		switch p.recordSeenBlock(slot, proposerIndex, blockRoot) {
+		case 0:
+			// The block that owns the slot.
+		case 1:
+			// Forwarded: a slashing needs two conflicting blocks, and the network
+			// cannot act on what it never sees.
+			return p.finishValidation(ctx, msg, pubsub.ValidationAccept, reasonEquivocation, nil, start)
+		default:
+			// Two is enough to slash on, and a proposer can mint any number.
+			return p.finishValidation(ctx, msg, pubsub.ValidationIgnore, reasonEquivocationSpam, nil, start)
+		}
+	}
+
 	return p.finishValidation(ctx, msg, pubsub.ValidationAccept, "", nil, start)
 }
+
+// errInternalSigning marks a failure on our side of the signature check, which
+// must not be read as evidence against the sender.
+var errInternalSigning = errors.New("internal signing failure")
 
 // verifyProposerSignature checks the block's proposer signature against the
 // pubkey from the cached duty. No beacon state is involved: the domain comes
@@ -216,7 +238,7 @@ func (p *PubSub) validateBeaconBlock(ctx context.Context, _ peer.ID, msg *pubsub
 func verifyProposerSignature(block interfaces.ReadOnlySignedBeaconBlock, blockRoot [32]byte, domain []byte, duty ProposerDuty) error {
 	signingRoot, err := signing.ComputeSigningRootForRoot(blockRoot, domain)
 	if err != nil {
-		return fmt.Errorf("compute signing root: %w", err)
+		return fmt.Errorf("%w: compute signing root: %w", errInternalSigning, err)
 	}
 
 	sig := block.Signature()
@@ -238,24 +260,67 @@ func slotDistance(a, b primitives.Slot) uint64 {
 	return uint64(b - a)
 }
 
-// isEquivocation reports whether a different block was already seen for this slot
-// and proposer. PeekOrAdd because validators run concurrently and a non-atomic
-// read-modify-write would let both blocks through.
-func (p *PubSub) isEquivocation(slot primitives.Slot, proposerIndex primitives.ValidatorIndex, root [32]byte) bool {
-	key := fmt.Sprintf("%d/%d", slot, proposerIndex)
-
-	seen, ok, _ := p.seenBlocks.PeekOrAdd(key, root)
-	return ok && seen != root
+func seenBlockKey(slot primitives.Slot, proposerIndex primitives.ValidatorIndex) string {
+	return fmt.Sprintf("%d/%d", slot, proposerIndex)
 }
 
-func newSeenBlockCache() (*lru.Cache[string, [32]byte], error) {
-	return lru.New[string, [32]byte](equivocationCacheSize)
+// maxTrackedEquivocations is how many distinct blocks past the first are kept per
+// slot. One is enough: it is the only one that gets forwarded, and everything
+// after it takes the same path whether it is remembered or not.
+const maxTrackedEquivocations = 1
+
+// seenBlock is the first block seen for a (slot, proposer) plus the distinct
+// others that followed it, in arrival order. Remembering them, rather than just
+// counting, keeps a given block's verdict the same on every delivery.
+type seenBlock struct {
+	root   [32]byte
+	others [][32]byte
+}
+
+// recordSeenBlock returns this block's place among those seen for the slot: 0 for
+// the one that owns it, then 1 for the first equivocation and so on. Locked rather
+// than using the cache's own atomics because this is a read-modify-write and
+// validators run concurrently.
+func (p *PubSub) recordSeenBlock(slot primitives.Slot, proposerIndex primitives.ValidatorIndex, root [32]byte) int {
+	key := seenBlockKey(slot, proposerIndex)
+
+	p.seenBlocksMu.Lock()
+	defer p.seenBlocksMu.Unlock()
+
+	entry, ok := p.seenBlocks.Get(key)
+	if !ok {
+		p.seenBlocks.Add(key, &seenBlock{root: root})
+		return 0
+	}
+
+	// The block that owns the slot, delivered again.
+	if entry.root == root {
+		return 0
+	}
+
+	for i, seen := range entry.others {
+		if seen == root {
+			return i + 1
+		}
+	}
+
+	if len(entry.others) < maxTrackedEquivocations {
+		entry.others = append(entry.others, root)
+		return len(entry.others)
+	}
+
+	// Past what is tracked, so past anything a slashing needs.
+	return maxTrackedEquivocations + 1
+}
+
+func newSeenBlockCache() (*lru.Cache[string, *seenBlock], error) {
+	return lru.New[string, *seenBlock](equivocationCacheSize)
 }
 
 // mapPubSubTopicWithValidators returns the validator for a topic, or nil to keep
 // upstream's accept-everything behaviour.
 func (p *PubSub) mapPubSubTopicWithValidators(topic string) pubsub.ValidatorEx {
-	if !p.cfg.Validation.enabled() {
+	if !p.cfg.MsgValidation.enabled() {
 		return nil
 	}
 

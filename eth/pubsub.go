@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p"
@@ -30,7 +31,7 @@ type PubSubConfig struct {
 	Encoder        encoder.NetworkEncoding
 	SecondsPerSlot time.Duration
 	DataStream     host.DataStream
-	Validation     ValidationConfig
+	MsgValidation  MsgValidationConfig
 	Meter          metric.Meter
 }
 
@@ -39,14 +40,14 @@ func (p PubSubConfig) Validate() error {
 		return fmt.Errorf("nil encoder")
 	}
 
-	if err := p.Validation.Validate(); err != nil {
+	if err := p.MsgValidation.Validate(); err != nil {
 		return err
 	}
 
 	// The validator dereferences these on every message, where a nil would panic a
 	// gossipsub validation goroutine and take the process down, so fail at startup
 	// instead.
-	if p.Validation.enabled() {
+	if p.MsgValidation.enabled() {
 		if p.Chain == nil || p.Chain.cfg == nil || p.Chain.cfg.GenesisConfig == nil {
 			return fmt.Errorf("validation requires a chain with a genesis configuration")
 		}
@@ -75,12 +76,15 @@ type PubSub struct {
 
 	// seenBlocks remembers the first block root per (slot, proposer) so a second,
 	// different block for the same slot can be spotted without a beacon state.
-	seenBlocks *lru.Cache[string, [32]byte]
-	meters     *validationMeters
+	seenBlocksMu         sync.Mutex
+	seenBlocks           *lru.Cache[string, *seenBlock]
+	msgValidationMetrics *msgValidationMetrics
 
-	// withheldC carries trace events for messages the validator did not forward,
-	// so emitting them cannot block a validation worker.
-	withheldC chan *host.TraceEvent
+	// Which topics already have a validator, and on which gossipsub. Per topic so a
+	// restart after a partial pass neither duplicates a registration nor leaves a
+	// topic unvalidated; keyed on the instance so a new one registers afresh.
+	validators   map[string]bool
+	validatorsOn *pubsub.PubSub
 }
 
 func NewPubSub(h *host.Host, cfg *PubSubConfig) (*PubSub, error) {
@@ -108,11 +112,10 @@ func NewPubSub(h *host.Host, cfg *PubSubConfig) (*PubSub, error) {
 		cfg:        cfg,
 		dsr:        dsr,
 		seenBlocks: seenBlocks,
-		withheldC:  make(chan *host.TraceEvent, withheldQueueSize),
 	}
 
-	if err := ps.initValidationMetrics(cfg.Meter); err != nil {
-		return nil, fmt.Errorf("init validation metrics: %w", err)
+	if err := ps.initMsgValidationMetrics(cfg.Meter); err != nil {
+		return nil, fmt.Errorf("init msg validation metrics: %w", err)
 	}
 
 	return ps, nil
@@ -125,18 +128,23 @@ func (p *PubSub) Serve(ctx context.Context) error {
 
 	supervisor := suture.NewSimple("pubsub")
 
-	if p.cfg.Validation.enabled() {
-		go p.serveWithheldEvents(ctx)
+	if p.validatorsOn != p.gs {
+		p.validators = make(map[string]bool)
+		p.validatorsOn = p.gs
 	}
 
 	for _, topicName := range p.cfg.Topics {
 		// Register before joining: a validator attached after the first message
 		// arrives would let that message through unchecked.
-		if validator := p.mapPubSubTopicWithValidators(topicName); validator != nil {
+		// Registration outlives this service, which suture may restart. Leaving the
+		// validator attached keeps every restart validated, and re-registering on
+		// the same gossipsub would fail as a duplicate.
+		if validator := p.mapPubSubTopicWithValidators(topicName); validator != nil && !p.validators[topicName] {
 			if err := p.gs.RegisterTopicValidator(topicName, validator); err != nil {
 				return fmt.Errorf("register topic validator %s: %w", topicName, err)
 			}
-			slog.Info("Registered gossip validator", "topic", topicName, "mode", p.cfg.Validation.Mode)
+			p.validators[topicName] = true
+			slog.Info("Registered gossip validator", "topic", topicName, "mode", p.cfg.MsgValidation.Mode)
 		}
 
 		topic, err := p.gs.Join(topicName)

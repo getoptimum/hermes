@@ -19,7 +19,6 @@ import (
 	"github.com/urfave/cli/v2"
 	"go.opentelemetry.io/otel"
 
-	"github.com/probe-lab/hermes/eth"
 	"github.com/probe-lab/hermes/host"
 	"github.com/probe-lab/hermes/tele"
 )
@@ -28,7 +27,6 @@ const (
 	flagCategoryLogging    = "Logging Configuration:"
 	flagCategoryTelemetry  = "Telemetry Configuration:"
 	flagCategoryDataStream = "DataStream Configuration:"
-	flagCategoryValidation = "Validation Configuration:"
 )
 
 var rootConfig = struct {
@@ -69,9 +67,6 @@ var rootConfig = struct {
 	FilterMode                  string
 	FilterPatterns              []string
 	DirectConnections           []string
-	ValidationMode              string
-	ValidationFailOpen          bool
-	ValidationSlotWindow        uint64
 
 	// unexported fields are derived from the configuration
 	awsConfig *aws.Config
@@ -118,9 +113,6 @@ var rootConfig = struct {
 	FilterMode:                  "denylist",
 	FilterPatterns:              []string{"^hermes*"}, // avoid connecting to other hermes instances by default
 	DirectConnections:           nil,
-	ValidationMode:              string(eth.ValidationModeOff), // upstream behaviour: observe, never withhold
-	ValidationFailOpen:          true,
-	ValidationSlotWindow:        4,
 
 	// unexported fields are derived or initialized during startup
 	awsConfig:           nil,
@@ -381,30 +373,6 @@ var rootFlags = []cli.Flag{
 		Usage:       "Peer filter mode: disabled, denylist, or allowlist",
 		Value:       rootConfig.FilterMode,
 		Destination: &rootConfig.FilterMode,
-	},
-	&cli.StringFlag{
-		Name:        "validation.mode",
-		EnvVars:     []string{"HERMES_VALIDATION_MODE"},
-		Usage:       "Gossip validation depth: off, structural, or full. Anything but off stops hermes forwarding messages it can prove are invalid",
-		Value:       rootConfig.ValidationMode,
-		Destination: &rootConfig.ValidationMode,
-		Category:    flagCategoryValidation,
-	},
-	&cli.BoolFlag{
-		Name:        "validation.fail-open",
-		EnvVars:     []string{"HERMES_VALIDATION_FAIL_OPEN"},
-		Usage:       "Forward structurally valid messages that could not be fully verified, e.g. when the proposer duty cache is cold",
-		Value:       rootConfig.ValidationFailOpen,
-		Destination: &rootConfig.ValidationFailOpen,
-		Category:    flagCategoryValidation,
-	},
-	&cli.Uint64Flag{
-		Name:        "validation.slot-window",
-		EnvVars:     []string{"HERMES_VALIDATION_SLOT_WINDOW"},
-		Usage:       "How many slots either side of the current slot a block may claim before it is ignored",
-		Value:       rootConfig.ValidationSlotWindow,
-		Destination: &rootConfig.ValidationSlotWindow,
-		Category:    flagCategoryValidation,
 	},
 	&cli.StringSliceFlag{
 		Name:    "libp2p.filter.patterns",

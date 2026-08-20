@@ -72,6 +72,16 @@ func (c *proposerDutyCache) Lookup(slot primitives.Slot) (duty ProposerDuty, dom
 	return duty, ed.domain, true, !ed.speculative
 }
 
+// hasAuthoritative reports whether epoch is cached as a binding schedule. A
+// speculative entry can confirm a block but never condemn one, so full mode is
+// degraded without one.
+func (c *proposerDutyCache) hasAuthoritative(epoch primitives.Epoch) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	ed, ok := c.epochs[epoch]
+	return ok && !ed.speculative
+}
+
 // needsFetch reports whether epoch is missing, or cached only as a speculative
 // prediction that has since become current and should be replaced.
 func (c *proposerDutyCache) needsFetch(epoch, currentEpoch primitives.Epoch) bool {
@@ -102,23 +112,66 @@ func (c *proposerDutyCache) store(epoch primitives.Epoch, ed *epochDuties, keep 
 
 // ProposerDutyForSlot exposes the cached schedule to the pubsub validator.
 func (c *Chain) ProposerDutyForSlot(slot primitives.Slot) (ProposerDuty, []byte, bool, bool) {
-	return c.duties.Lookup(slot)
+	return c.proposerDuties.Lookup(slot)
 }
 
-// refreshProposerDuties keeps the previous, current and next epoch cached.
-// Fetching ahead removes the epoch-boundary gap where a block arrives before its
-// schedule does; the next-epoch entry is marked speculative and re-fetched once
-// that epoch is current, because the prediction is not binding.
-//
-// Errors are returned for logging only; a stale cache degrades validation to the
-// structural checks rather than stalling relay.
-func (c *Chain) refreshProposerDuties(ctx context.Context) error {
+// dutyRefreshTimeout bounds one refresh pass. Generous because it covers up to
+// three sequential requests to a beacon node that may be remote.
+const dutyRefreshTimeout = 30 * time.Second
+
+// refreshProposerDuties refreshes the cache from the chain's Serve context. A
+// failure only degrades validation, so it is logged rather than returned.
+func (c *Chain) refreshProposerDuties(ctx context.Context) {
 	if !c.cfg.TrackProposerDuties {
-		return nil
+		return
 	}
+
+	// One pass at a time, so a slow beacon node cannot have refreshes stack up.
+	if !c.dutyRefreshing.CompareAndSwap(false, true) {
+		return
+	}
+	defer c.dutyRefreshing.Store(false)
+
+	ctx, cancel := context.WithTimeout(ctx, dutyRefreshTimeout)
+	defer cancel()
 
 	currentEpoch := slots.ToEpoch(slots.CurrentSlot(c.cfg.GenesisConfig.GenesisTime))
 
+	err := c.updateProposerDutyCache(ctx, currentEpoch)
+
+	// A binding schedule for the current epoch is what full mode needs. Fetches
+	// can fail on the next epoch alone, which is at the beacon API's lookahead
+	// limit, and they can succeed while only ever returning a speculative answer.
+	if c.proposerDuties.hasAuthoritative(currentEpoch) {
+		if c.dutiesDegraded.Swap(false) {
+			slog.Info("proposer duties refreshed again, validation is no longer degraded")
+		}
+		if err != nil {
+			slog.Debug("partially refreshed proposer duties", tele.LogAttrError(err))
+		}
+		return
+	}
+
+	// Once per outage, not once per slot. err is nil when the schedule is present
+	// but still the previous pass's prediction for this epoch.
+	attrs := []any{"epoch", currentEpoch}
+	if err != nil {
+		attrs = append(attrs, tele.LogAttrError(err))
+	} else {
+		attrs = append(attrs, "reason", "schedule is only a prediction")
+	}
+	if !c.dutiesDegraded.Swap(true) {
+		slog.Warn("no binding proposer schedule, validation will degrade", attrs...)
+		return
+	}
+	slog.Debug("still without a binding proposer schedule", attrs...)
+}
+
+// updateProposerDutyCache keeps the previous, current and next epoch cached.
+// Fetching ahead removes the epoch-boundary gap where a block arrives before its
+// schedule does; the next-epoch entry is marked speculative and re-fetched once
+// that epoch is current, because the prediction is not binding.
+func (c *Chain) updateProposerDutyCache(ctx context.Context, currentEpoch primitives.Epoch) error {
 	wanted := make([]primitives.Epoch, 0, dutyEpochsRetained)
 	if currentEpoch > 0 {
 		wanted = append(wanted, currentEpoch-1)
@@ -127,7 +180,7 @@ func (c *Chain) refreshProposerDuties(ctx context.Context) error {
 
 	var errs []error
 	for _, epoch := range wanted {
-		if !c.duties.needsFetch(epoch, currentEpoch) {
+		if !c.proposerDuties.needsFetch(epoch, currentEpoch) {
 			continue
 		}
 
@@ -138,7 +191,7 @@ func (c *Chain) refreshProposerDuties(ctx context.Context) error {
 		}
 
 		ed.speculative = epoch > currentEpoch
-		c.duties.store(epoch, ed, wanted)
+		c.proposerDuties.store(epoch, ed, wanted)
 		slog.Debug("cached proposer duties",
 			"epoch", epoch, "slots", len(ed.duties), "speculative", ed.speculative)
 	}
@@ -172,38 +225,4 @@ func (c *Chain) fetchEpochDuties(ctx context.Context, epoch primitives.Epoch) (*
 	}
 
 	return &epochDuties{duties: duties, domain: domain}, nil
-}
-
-// dutyRefreshTimeout bounds one refresh pass. Generous because it covers up to
-// three sequential requests to a beacon node that may be remote.
-const dutyRefreshTimeout = 30 * time.Second
-
-// startProposerDutyRefresh refreshes the schedule in the background.
-//
-// Deliberately detached from the caller's context. epochUpdate runs on the
-// construction path, where NewNode shares one 10s deadline across the whole
-// handshake, so doing this inline could both delay startup and burn the budget
-// that the following ChainHead call needs, turning a slow beacon node into a
-// node that will not start. Errors only degrade validation, so they are never
-// worth failing on.
-func (c *Chain) startProposerDutyRefresh() {
-	if !c.cfg.TrackProposerDuties {
-		return
-	}
-
-	// One in flight at a time, in case a refresh outlives the epoch tick.
-	if !c.dutyRefreshing.CompareAndSwap(false, true) {
-		return
-	}
-
-	go func() {
-		defer c.dutyRefreshing.Store(false)
-
-		ctx, cancel := context.WithTimeout(context.Background(), dutyRefreshTimeout)
-		defer cancel()
-
-		if err := c.refreshProposerDuties(ctx); err != nil {
-			slog.Warn("failed refreshing proposer duties, validation will degrade", tele.LogAttrError(err))
-		}
-	}()
 }

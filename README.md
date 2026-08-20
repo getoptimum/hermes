@@ -118,12 +118,6 @@ GLOBAL OPTIONS:
    --tracing.addr value  Where to publish the traces to. (default: "localhost") [$HERMES_TRACING_ADDR]
    --tracing.port value  On which port does the traces collector listen (default: 4317) [$HERMES_TRACING_PORT]
 
-   Validation Configuration:
-
-   --validation.fail-open          Forward structurally valid messages that could not be fully verified, e.g. when the proposer duty cache is cold (default: true) [$HERMES_VALIDATION_FAIL_OPEN]
-   --validation.mode value         Gossip validation depth: off, structural, or full. Anything but off stops hermes forwarding messages it can prove are invalid (default: "off") [$HERMES_VALIDATION_MODE]
-   --validation.slot-window value  How many slots either side of the current slot a block may claim before it is ignored (default: 4) [$HERMES_VALIDATION_SLOT_WINDOW]
-
 ```
 
 </details>
@@ -349,6 +343,9 @@ OPTIONS:
    --subnet.blobsidecar.count value                                               Number of random blob sidecar subnets to select when type=random (default: 0) [$HERMES_ETH_SUBNET_BLOBSIDECAR_COUNT]
    --subnet.blobsidecar.start value                                               Start of subnet range (inclusive) for blob sidecar when type=static_range (default: 0) [$HERMES_ETH_SUBNET_BLOBSIDECAR_START]
    --subnet.blobsidecar.end value                                                 End of subnet range (exclusive) for blob sidecar when type=static_range (default: 0) [$HERMES_ETH_SUBNET_BLOBSIDECAR_END]
+   --validation.mode value                                                        Gossip validation depth: off, structural, or full. Anything but off stops hermes forwarding messages it can prove are invalid (default: "off") [$HERMES_ETH_VALIDATION_MODE]
+   --validation.fail-open                                                         Forward structurally valid messages that could not be fully verified, e.g. when the proposer duty cache is cold (default: true) [$HERMES_ETH_VALIDATION_FAIL_OPEN]
+   --validation.slot-window value                                                 How many slots either side of the current slot a block may claim before it is ignored. 0 means the default (default: 4) [$HERMES_ETH_VALIDATION_SLOT_WINDOW]
    --help, -h                                                                     show help
 ```
 
@@ -364,19 +361,25 @@ Hermes stops propagating messages it can prove are invalid:
 | --- | --- |
 | `off` (default) | Forward everything, decode afterwards. |
 | `structural` | Only the checks that need no external data. |
-| `full` | Adds the proposer and signature checks, which read the proposer schedule that the chain's epoch loop caches from the beacon node. |
+| `full` | Adds the proposer and signature checks, which read the proposer schedule the chain caches from the beacon node. |
 
-Messages that are provably bad are rejected, which debits the sender's gossip score.
-Anything Hermes merely cannot confirm is ignored instead:
+Messages proven bad against something the sender committed to are rejected, which debits the
+sender's gossip score. Anything Hermes merely cannot confirm is ignored instead, including a
+failed decode: the block type comes from Hermes' own view of the fork, so a decode failure is
+not proof against the sender. A second block for one slot is
+forwarded rather than withheld, since a double proposal is slashable and the network needs
+to see it; the counter is what records that it happened:
 
 | Wrongness | Mode | Result | `reason` label |
 | --- | --- | --- | --- |
-| Not valid SSZ for the current fork's block type, or a nil block | structural | reject | `decode` |
+| Not valid SSZ for the current fork's block type, or a nil block | structural | ignore | `decode` |
 | Current fork has no known block type | structural | ignore | `unknown_fork` |
+| Hermes could not merkleize the block, which is its own fault, not the sender's | full | ignore | `internal_error` |
 | Claimed slot further from the current slot than the slot window | structural | ignore | `slot_out_of_window` |
 | Not the scheduled proposer for that slot | full | reject | `wrong_proposer_index` |
 | Proposer signature does not verify | full | reject | `bad_proposer_signature` |
-| A second, distinct block for the same slot and proposer | full | ignore | `equivocation` |
+| A second, distinct block for the same slot and proposer | full | forwarded, counted | `equivocation` |
+| A third or later distinct block for one slot, which adds nothing a slashing needs | full | ignore | `equivocation_spam` |
 | No cached schedule for the slot | full | ignore unless fail-open | `duties_unavailable` |
 | Mismatch against a next-epoch prediction | full | ignore unless fail-open | `duties_speculative` |
 
@@ -385,9 +388,10 @@ be fully verified, so a beacon node outage degrades relay instead of stalling it
 `--validation.slot-window` (default `4`) sets how far from the current slot a block may
 claim to be.
 
-Every message Hermes does not forward is still reported on the data stream as a
-`WITHHELD_MESSAGE` event, carrying the topic, message ID and size, the sender, and the
-result and reason above.
+The validator itself writes nothing to the data stream: it runs while holding the topic's
+validation slot, so a slow sink there would stall block validation. Gossipsub's own tracer
+already reports every non-forwarded message as `REJECT_MESSAGE`, and the specific reason
+above is carried by `validation_result_total`.
 
 ### Filecoin
 
@@ -498,7 +502,6 @@ addition to the libp2p and gossipsub ones:
 | `validation_result_total` | `topic`, `result`, `reason` |
 | `validation_degraded_total` | `topic`, `reason` |
 | `validation_duration_seconds` | `topic`, `result` |
-| `validation_withheld_dropped_total` | `topic`, `reason` |
 
 ### Tracing
 

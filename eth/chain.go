@@ -64,8 +64,6 @@ type ChainConfig struct {
 	SyncSubnetConfig        *SubnetConfig
 	ColumnSubnetConfig      *SubnetConfig
 
-	// TrackProposerDuties keeps the proposer schedule cached for gossip
-	// validation. Off unless validation needs it.
 	TrackProposerDuties bool
 }
 
@@ -76,9 +74,10 @@ type Chain struct {
 	Fork             chainFork
 	chainUpgradeSubs []chainUpgradeSubFn
 
-	// Proposer schedule for gossip validation, read on the message path.
-	duties         *proposerDutyCache
+	// Read on the message path by gossip validation.
+	proposerDuties *proposerDutyCache
 	dutyRefreshing atomic.Bool
+	dutiesDegraded atomic.Bool
 
 	// TODO:
 	// - DataColumn Cache
@@ -98,7 +97,7 @@ func NewChain(ctx context.Context, cfg *ChainConfig) (*Chain, error) {
 		closeC:           make(chan struct{}),
 		statusHolder:     &StatusHolder{},
 		metadataHolder:   &MetadataHolder{},
-		duties:           newProposerDutyCache(),
+		proposerDuties:   newProposerDutyCache(),
 	}
 
 	err := chain.init(ctx)
@@ -154,10 +153,6 @@ func (c *Chain) epochUpdate(ctx context.Context) error {
 			"duration", time.Since(t),
 		)
 	}()
-	// Detached from ctx: on the construction path that deadline is the whole
-	// node's startup budget. See startProposerDutyRefresh.
-	c.startProposerDutyRefresh()
-
 	// check if new hardfork
 	slog.Info("Getting Prysm's chain head...")
 	chainHead, err := c.cfg.clClient.ChainHead(ctx)
@@ -251,10 +246,40 @@ func (c *Chain) Serve(ctx context.Context) error {
 	defer func() {
 		slog.Info("chain internal loop closing up")
 	}()
+
+	// Closing via closeC returns without cancelling the caller's ctx, so scope the
+	// refreshes below to this loop's lifetime.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// Not on the construction path: there epochUpdate shares one short deadline
+	// with the rest of the node's startup. Spawned so a slow beacon node cannot
+	// hold up the loop's shutdown cases; ctx is the chain's lifetime.
+	go c.refreshProposerDuties(ctx)
+
+	// Tickers, not time.After: a fresh timer per loop iteration would be reset by
+	// every other case firing, and the slower one would never elapse.
+	epochUpdates := time.NewTicker(120 * time.Second)
+	defer epochUpdates.Stop()
+
+	// Per slot rather than per epoch update: at a rollover the current epoch is
+	// held only as the previous pass's prediction, which can confirm a block but
+	// never reject one. A pass is a map lookup once every epoch it wants is
+	// cached, and at most two requests while one is not.
+	var dutyRefreshes <-chan time.Time
+	if c.cfg.TrackProposerDuties {
+		ticker := time.NewTicker(c.slotDuration())
+		defer ticker.Stop()
+		dutyRefreshes = ticker.C
+	}
+
 	for {
 		select {
+		case <-dutyRefreshes:
+			go c.refreshProposerDuties(ctx)
+
 		// Epoch iteration:
-		case <-time.After(120 * time.Second):
+		case <-epochUpdates.C:
 			slog.Info("chian internal: new chain epoch...")
 			err := c.epochUpdate(ctx)
 			if err != nil {
@@ -446,6 +471,15 @@ func (c *Chain) CurrentSeqNumber() primitives.SSZUint64 {
 
 func (c *Chain) CurrentForkDigest() [4]byte {
 	return [4]byte(c.statusHolder.ForkDigest())
+}
+
+// slotDuration falls back to the mainnet value, since the ticker only paces a
+// cache refresh and a nil beacon config must not panic the chain loop.
+func (c *Chain) slotDuration() time.Duration {
+	if c.cfg.BeaconConfig == nil || c.cfg.BeaconConfig.SecondsPerSlot == 0 {
+		return 12 * time.Second
+	}
+	return time.Duration(c.cfg.BeaconConfig.SecondsPerSlot) * time.Second
 }
 
 func (c *Chain) CurrentFork() chainFork {

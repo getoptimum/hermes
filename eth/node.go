@@ -206,7 +206,7 @@ func NewNode(cfg *NodeConfig) (*Node, error) {
 		SyncSubnetConfig:        syncConfig,
 		ColumnSubnetConfig:      columConfig,
 		// Only full validation consults the proposer schedule.
-		TrackProposerDuties: cfg.Validation.Mode == ValidationModeFull,
+		TrackProposerDuties: cfg.MsgValidation.Mode == MsgValidationModeFull,
 	}
 	chain, err := NewChain(ctx, chainCfg)
 	if err != nil {
@@ -248,7 +248,7 @@ func NewNode(cfg *NodeConfig) (*Node, error) {
 		Encoder:        cfg.GossipSubMessageEncoder,
 		SecondsPerSlot: time.Duration(cfg.BeaconConfig.SecondsPerSlot) * time.Second,
 		DataStream:     ds,
-		Validation:     cfg.Validation,
+		MsgValidation:  cfg.MsgValidation,
 		Meter:          cfg.Meter,
 	}
 
